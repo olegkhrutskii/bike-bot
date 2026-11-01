@@ -29,6 +29,8 @@ sent_ads = set()
 CHOTOT_URL = "https://www.chotot.com/da-nang/mua-ban-xe-may/50cc"
 MY_CHAT_ID = None
 
+user_notifications_active = {}
+
 MAX_PRICE_VND = 9_000_000
 ALLOWED_KEYWORDS = ["50cc", "lead", "air blade", "airblade", "cub", "scoopy", "sym", "kymco", "today", "giorno"]
 STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua", "đồ chơi"]
@@ -52,7 +54,7 @@ async def start_web_server():
 
 
 # =====================================================================
-# 3. КНОПКА «МЕНЮ» И ОБРАБОТЧИКИ
+# 3. КНОПКИ И ОБРАБОТЧИКИ
 # =====================================================================
 async def set_main_menu(bot: Bot):
     main_commands = [
@@ -61,15 +63,23 @@ async def set_main_menu(bot: Bot):
     ]
     await bot.set_my_commands(main_commands)
 
+def get_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
+    is_active = user_notifications_active.get(chat_id, True)
+    toggle_text = "🔕 Выключить уведомления" if is_active else "🔔 Включить уведомления"
+    
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Проверить байки")],
+            [KeyboardButton(text=toggle_text)]
+        ],
+        resize_keyboard=True
+    )
+
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     global MY_CHAT_ID
     MY_CHAT_ID = message.chat.id
-    
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔍 Проверить байки")]],
-        resize_keyboard=True
-    )
+    user_notifications_active[message.chat.id] = True
     
     await message.answer(
         "Привет, Олег! 🛵 Жесткий фильтр по цене включен.\n\n"
@@ -77,13 +87,25 @@ async def start_handler(message: types.Message):
         "• Цена: СТРОГО до 9 млн VND\n"
         "• Модели: 50cc, Honda Lead, Honda Air Blade (и др.)\n"
         "• ИИ-анализ каждого подходящего объявления активен!",
-        reply_markup=keyboard
+        reply_markup=get_keyboard(message.chat.id)
     )
 
 @dp.message(F.text == "🔍 Проверить байки")
 async def button_check_handler(message: types.Message):
     await message.answer("🔍 Ищу байки строго до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
+
+@dp.message(F.text.in_(["🔕 Выключить уведомления", "🔔 Включить уведомления"]))
+async def toggle_notifications_handler(message: types.Message):
+    chat_id = message.chat.id
+    current_state = user_notifications_active.get(chat_id, True)
+    new_state = not current_state
+    user_notifications_active[chat_id] = new_state
+    
+    if new_state:
+        await message.answer("🔔 Уведомления включены! Бот снова будет присылать найденные варианты.", reply_markup=get_keyboard(chat_id))
+    else:
+        await message.answer("🔕 Уведомления выключены. Бот работает в тихом режиме (автопроверка идет, но сообщения приходить не будут).", reply_markup=get_keyboard(chat_id))
 
 @dp.message(Command("check"))
 async def manual_check_handler(message: types.Message):
@@ -147,6 +169,9 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
 # 5. ПАРСИНГ И ФИЛЬТРАЦИЯ
 # =====================================================================
 async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
+    if is_auto and not user_notifications_active.get(chat_id, True):
+        return
+
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(CHOTOT_URL, headers=headers)
@@ -204,7 +229,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                             f"🤖 **Анализ Gemini:**\n{ai_summary}\n\n"
                             f"🔗 {ad_url}"
                         )
-                        await bot.send_message(chat_id, text)
+                        await bot.send_message(chat_id, text, reply_markup=get_keyboard(chat_id))
                         await asyncio.sleep(2)
 
                     except Exception as sub_e:
@@ -212,7 +237,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         continue
                     
         if new_ads_count == 0 and not is_auto:
-            await bot.send_message(chat_id, "📭 Новых вариантов строго до 9 млн VND с нужными моделями пока нет.")
+            await bot.send_message(chat_id, "📭 Новых вариантов строго до 9 млн VND с нужными моделями пока нет.", reply_markup=get_keyboard(chat_id))
             
     except Exception as e:
         logging.error(f"Ошибка при парсинге: {e}")
@@ -231,13 +256,9 @@ async def main():
     print("Бот и веб-сервер запускаются...")
     await set_main_menu(bot)
     
-    # Запускаем веб-сервер параллельно в фоне, чтобы Render был доволен
     asyncio.create_task(start_web_server())
-    
-    # Запускаем автопроверку байков
     asyncio.create_task(auto_check_loop())
     
-    # Запуск самого бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
