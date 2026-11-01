@@ -476,14 +476,18 @@ async def auto_check_loop():
                 logging.error(f"Ошибка в автопроверке: {e}")
 
 async def main():
-    print("Бот и веб-сервер запускаются...")
+    print("Запуск веб-сервера для Render...")
+    # 1. Мгновенно поднимаем веб-сервер, чтобы Render сразу увидел порт
+    asyncio.create_task(start_web_server())
+    
+    print("Инициализация бота...")
     await set_main_menu(bot)
     
-    # Запускаем веб-сервер и фоновый цикл проверки параллельно
-    asyncio.create_task(start_web_server())
+    # 2. Запускаем фоновую автопроверку
     asyncio.create_task(auto_check_loop())
     
-    # Запуск основного пулинга бота
+    print("Бот запущен и слушает Telegram...")
+    # 3. Запуск основного поллинга
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
