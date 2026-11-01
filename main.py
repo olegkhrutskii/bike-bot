@@ -32,7 +32,8 @@ MY_CHAT_ID = None
 user_notifications_active = {}
 
 MAX_PRICE_VND = 9_000_000
-ALLOWED_KEYWORDS = ["50cc", "lead", "air blade", "airblade", "cub", "scoopy", "sym", "kymco", "today", "giorno"]
+# Удалили общий "sym", чтобы не пропускать 125-кубовые Attila и т.д.
+ALLOWED_KEYWORDS = ["50cc", "lead", "air blade", "airblade", "cub", "scoopy", "kymco", "today", "giorno", "sym 50"]
 STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua", "đồ chơi"]
 
 
@@ -146,6 +147,11 @@ def extract_price_from_text(text: str) -> int:
                 return val
     return 0
 
+def markdown_to_html(text: str) -> str:
+    # Конвертируем маркдаун звездочки Gemini в HTML-теги для красивого жирного текста в Телеграме
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    return text
+
 async def analyze_ad_with_gemini(ad_text: str) -> str:
     prompt = (
         "Проанализируй текст объявления о продаже мопеда/скутера во Вьетнаме. "
@@ -160,7 +166,8 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
             model='gemini-3.5-flash-lite',
             contents=prompt,
         )
-        return response.text
+        # Очищаем от звездочек маркдауна перед выдачей
+        return markdown_to_html(response.text)
     except Exception:
         return "Не удалось проанализировать описание."
 
@@ -187,7 +194,6 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
         found_ad_urls = []
         for ad in ads:
             href = ad['href']
-            # ТОЧНЫЙ фильтр: берем только ссылки, похожие на конкретные объявления (содержат -li или цифры в конце)
             if "-li" in href or re.search(r'\d+\.htm$', href):
                 ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
                 if ad_url not in found_ad_urls and ad_url != CHOTOT_URL:
@@ -207,7 +213,6 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     full_page_text = sub_soup.get_text()
                     full_page_text_lower = full_page_text.lower()
                     
-                    # Пропускаем разделы и категории
                     if "mua ban xe" in full_page_text_lower and len(full_page_text) < 500:
                         sent_ads.add(ad_url)
                         continue
@@ -220,12 +225,10 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         sent_ads.add(ad_url)
                         continue
 
-                    # Пытаемся найти описание разными способами
                     desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
                     if desc_block:
                         ad_description = desc_block.get_text(separator="\n")
                     else:
-                        # Если специфического блока нет, берем основной текст страницы (ограничиваем до 2000 символов)
                         ad_description = full_page_text[:2000]
                     
                     detected_price = extract_price_from_text(full_page_text)
@@ -269,6 +272,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
             
     except Exception as e:
         logging.error(f"Ошибка при парсинге: {e}")
+
 
 # =====================================================================
 # 6. АВТОПРОВЕРКА И ГЛАВНЫЙ ЗАПУСК
