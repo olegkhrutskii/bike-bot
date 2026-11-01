@@ -379,12 +379,32 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
 # =====================================================================
 # 6. АВТОПРОВЕРКА И ГЛАВНЫЙ ЗАПУСК
 # =====================================================================
+# =====================================================================
+# 6. АВТОПРОВЕРКА И ГЛАВНЫЙ ЗАПУСК
+# =====================================================================
 async def auto_check_loop():
     while True:
         await asyncio.sleep(600)
         if MY_CHAT_ID:
-            await check_chotot_and_notify(MY_CHAT_ID, is_auto=True)
+            try:
+                await check_chotot_and_notify(MY_CHAT_ID, is_auto=True)
+            except Exception as e:
+                logging.error(f"Ошибка в автопроверке: {e}")
 
 async def main():
     print("Бот и веб-сервер запускаются...")
-    await set
+    await set_main_menu(bot)
+    
+    # Запускаем веб-сервер в фоне для Render
+    asyncio.create_task(start_web_server())
+    # Запускаем фоновую проверку объявлений
+    asyncio.create_task(auto_check_loop())
+    
+    # Запуск поллинга телеграм-бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Остановлено.")
