@@ -386,20 +386,20 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                 if detected_price > 0 and detected_price > MAX_PRICE_VND:
                     continue
 
-               # Получаем ИИ-анализ
-    ai_summary = await analyze_ad_with_gemini(ad_description)
-    
-    # Берем самую первую строчку ответа ИИ в качестве заголовка
-    lines = [line.strip() for line in ai_summary.split('\n') if line.strip()]
-    clean_title = lines[0].replace('<b>', '').replace('</b>', '').replace('•', '').strip() if lines else "Байк до 9 млн"
-    clean_title = clean_title[:60]
-    
-    current_batch_scanned.append((ad_url, clean_title))
+                # Получаем ИИ-анализ
+                ai_summary = await analyze_ad_with_gemini(ad_description)
+                
+                # Берем самую первую строчку ответа ИИ в качестве заголовка
+                lines = [line.strip() for line in ai_summary.split('\n') if line.strip()]
+                clean_title = lines[0].replace('<b>', '').replace('</b>', '').replace('•', '').strip() if lines else "Байк до 9 млн"
+                clean_title = clean_title[:60]
+                
+                current_batch_scanned.append((ad_url, clean_title))
 
-    # Если объявление новое — отправляем полное уведомление в чат
-    if ad_url not in sent_ads:
-        sent_ads.add(ad_url)
-        new_ads_count += 1
+                # Если объявление новое — отправляем полное уведомление в чат
+                if ad_url not in sent_ads:
+                    sent_ads.add(ad_url)
+                    new_ads_count += 1
                     
                     price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> См. в описании ниже\n"
 
