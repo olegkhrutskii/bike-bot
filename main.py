@@ -1,13 +1,14 @@
 import os
 import asyncio
 import logging
+import json
 import re
 import requests
 from bs4 import BeautifulSoup
 from google import genai
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import BotCommand, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
 # =====================================================================
@@ -25,7 +26,28 @@ dp = Dispatcher()
 
 logging.basicConfig(level=logging.INFO)
 
-sent_ads = set()
+SENT_ADS_FILE = "sent_ads.json"
+FAV_ADS_FILE = "favorites.json"
+
+def load_json_set(filepath):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def save_json_set(filepath, data_set):
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(list(data_set), f)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения файла {filepath}: {e}")
+
+sent_ads = load_json_set(SENT_ADS_FILE)
+favorite_ads = load_json_set(FAV_ADS_FILE)
+
 CHOTOT_URL = "https://www.chotot.com/da-nang/mua-ban-xe-may/50cc"
 MY_CHAT_ID = None
 
@@ -60,6 +82,7 @@ async def set_main_menu(bot: Bot):
     main_commands = [
         BotCommand(command="start", description="🚀 Перезапустить бота"),
         BotCommand(command="check", description="🔍 Проверить новые байки"),
+        BotCommand(command="favorites", description="⭐ Избранные байки"),
     ]
     await bot.set_my_commands(main_commands)
 
@@ -69,7 +92,7 @@ def get_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
     
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Проверить байки")],
+            [KeyboardButton(text="🔍 Проверить байки"), KeyboardButton(text="⭐ Избранное")],
             [KeyboardButton(text=toggle_text)]
         ],
         resize_keyboard=True
@@ -82,11 +105,11 @@ async def start_handler(message: types.Message):
     user_notifications_active[message.chat.id] = True
     
     await message.answer(
-        "Привет, Олег! 🛵 Бот настроен и готов к работе.\n\n"
+        "Привет, Олег! 🛵 Бот настроен и защищен от повторов.\n\n"
         "🎯 <b>Критерии поиска:</b>\n"
         "• Цена: СТРОГО до 9 млн VND\n"
         "• Модели: 50cc, Honda Lead, Honda Air Blade (и др.)\n"
-        "• ИИ-анализ каждого подходящего объявления активен!",
+        "• Избранное с возможностью удаления активно!",
         parse_mode="HTML",
         reply_markup=get_keyboard(message.chat.id)
     )
@@ -95,6 +118,25 @@ async def start_handler(message: types.Message):
 async def button_check_handler(message: types.Message):
     await message.answer("🔍 Ищу байки строго до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
+
+@dp.message(F.text == "⭐ Избранное")
+@dp.message(Command("favorites"))
+async def show_favorites_handler(message: types.Message):
+    if not favorite_ads:
+        await message.answer("⭐ У тебя пока нет сохраненных байков в избранном.", reply_markup=get_keyboard(message.chat.id))
+        return
+    
+    await message.answer("⭐ <b>Твои сохраненные байки:</b>", parse_mode="HTML", reply_markup=get_keyboard(message.chat.id))
+    
+    for url in list(favorite_ads):
+        # Для каждой ссылки шлем отдельное сообщение с кнопкой удаления, чтобы было удобно управлять
+        inline_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{url}")]
+            ]
+        )
+        await message.answer(f"🔗 {url}", reply_markup=inline_kb)
+        await asyncio.sleep(0.3)
 
 @dp.message(F.text.in_(["🔕 Выключить уведомления", "🔔 Включить уведомления"]))
 async def toggle_notifications_handler(message: types.Message):
@@ -112,6 +154,42 @@ async def toggle_notifications_handler(message: types.Message):
 async def manual_check_handler(message: types.Message):
     await message.answer("🔍 Ищу байки строго до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
+
+@dp.callback_query(F.data.startswith("fav_"))
+async def callback_favorite_handler(callback: types.CallbackQuery):
+    # Достаем закодированный URL или ID из callback_data
+    action_data = callback.data.replace("fav_", "", 1)
+    
+    # Ищем исходный URL по хэшу
+    target_url = None
+    for url in sent_ads:
+        ad_id_match = re.search(r'-li(\d+)\.htm', url)
+        h = ad_id_match.group(1) if ad_id_match else str(hash(url))
+        if h == action_data:
+            target_url = url
+            break
+            
+    if target_url and target_url not in favorite_ads:
+        favorite_ads.add(target_url)
+        save_json_set(FAV_ADS_FILE, favorite_ads)
+        await callback.answer("⭐ Байк успешно добавлен в избранное!", show_alert=True)
+    else:
+        await callback.answer("⭐ Этот байк уже был в избранном или не найден.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("unfav_"))
+async def callback_unfavorite_handler(callback: types.CallbackQuery):
+    url_to_remove = callback.data.replace("unfav_", "", 1)
+    if url_to_remove in favorite_ads:
+        favorite_ads.remove(url_to_remove)
+        save_json_set(FAV_ADS_FILE, favorite_ads)
+        await callback.answer("🗑 Байк удален из избранного.", show_alert=True)
+        # Удаляем сообщение с этим байком из чата
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+    else:
+        await callback.answer("Байк уже удален.", show_alert=True)
 
 @dp.message()
 async def chat_handler(message: types.Message):
@@ -224,14 +302,17 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     
                     if "mua ban xe" in full_page_text_lower and len(full_page_text) < 500:
                         sent_ads.add(ad_url)
+                        save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
 
                     if any(stop_word in full_page_text_lower for stop_word in STOP_WORDS):
                         sent_ads.add(ad_url)
+                        save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
                         
                     if not any(keyword in full_page_text_lower for keyword in ALLOWED_KEYWORDS):
                         sent_ads.add(ad_url)
+                        save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
 
                     desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
@@ -240,21 +321,21 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     else:
                         ad_description = full_page_text[:2000]
                     
-                    # Извлекаем цену
                     detected_price = extract_price_from_text(full_page_text)
 
-                    # Если цена надежно определена и она выше 9 млн — отсекаем
                     if detected_price > 0 and detected_price > MAX_PRICE_VND:
                         sent_ads.add(ad_url)
+                        save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
 
-                    # Дополнительный страхующий фильтр для текста (если там явно указано 10-50 млн через tr)
                     match_high = re.search(r'\b(1[0-9]|[2-9][0-9])\s*(tr|triệu|trieu)\b', full_page_text_lower)
                     if match_high and detected_price == 0:
                         sent_ads.add(ad_url)
+                        save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
 
                     sent_ads.add(ad_url)
+                    save_json_set(SENT_ADS_FILE, sent_ads)
                     if len(sent_ads) > 500:
                         sent_ads.pop()
                         
@@ -268,7 +349,17 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}\n\n"
                         f"🔗 {ad_url}"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=get_keyboard(chat_id))
+                    
+                    ad_id_match = re.search(r'-li(\d+)\.htm', ad_url)
+                    cb_data = f"fav_{ad_id_match.group(1)}" if ad_id_match else f"fav_{hash(ad_url)}"
+                    
+                    inline_kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="⭐ В избранное", callback_data=cb_data)]
+                        ]
+                    )
+                    
+                    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=inline_kb)
                     await asyncio.sleep(2)
 
                 except Exception as sub_e:
