@@ -82,7 +82,7 @@ async def start_handler(message: types.Message):
     user_notifications_active[message.chat.id] = True
     
     await message.answer(
-        "Привет, Олег! 🛵 Жесткий фильтр по цене включен.\n\n"
+        "Привет, Олег! 🛵 Бот настроен и готов к работе.\n\n"
         "🎯 <b>Критерии поиска:</b>\n"
         "• Цена: СТРОГО до 9 млн VND\n"
         "• Модели: 50cc, Honda Lead, Honda Air Blade (и др.)\n"
@@ -127,10 +127,9 @@ async def chat_handler(message: types.Message):
 
 
 # =====================================================================
-# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ДВОЙНОЙ ФИЛЬТР ЦЕНЫ
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =====================================================================
 def extract_price_from_text(text: str) -> int:
-    # 1. Формат "12.8 tr", "12,8 triệu", "12tr8"
     match_tr = re.search(r'(\d+[\.,]?\d*)\s*(tr|triệu|trieu)', text, re.IGNORECASE)
     if match_tr:
         num_str = match_tr.group(1).replace(',', '.')
@@ -139,7 +138,6 @@ def extract_price_from_text(text: str) -> int:
         except ValueError:
             pass
 
-    # 2. Формат "12tr8"
     match_tr_split = re.search(r'(\d+)tr(\d+)', text, re.IGNORECASE)
     if match_tr_split:
         try:
@@ -149,7 +147,6 @@ def extract_price_from_text(text: str) -> int:
         except ValueError:
             pass
 
-    # 3. Длинные числа (например, 12800000 или 12.800.000)
     numbers = re.findall(r'\b\d[\d\.,]{6,}\b', text)
     for num_str in numbers:
         clean_num = re.sub(r'[^\d]', '', num_str)
@@ -165,15 +162,11 @@ def markdown_to_html(text: str) -> str:
     text = re.sub(r'^\*\s+', r'• ', text, flags=re.MULTILINE)
     return text
 
-async def analyze_ad_with_gemini(ad_text: str) -> tuple[str, bool]:
-    """Возвращает тупл: (текст_анализа, прошел_ли_фильтр_цены)"""
+async def analyze_ad_with_gemini(ad_text: str) -> str:
     prompt = (
-        "Проанализируй текст объявления о продаже мопеда/скутера во Вьетнаме.\n"
-        "ВНИМАНИЕ: Если точная цена байка в объявлении превышает 9 000 000 VND (9 миллионов донг / 9tr), "
-        "то напиши в первой строке ответа СТРОГО слово: REJECTED\n"
-        "Если цена до 9 000 000 VND (или не указана), напиши в первой строке слово: PASSED\n\n"
-        "Далее сделай краткую выжимку на русском языке:\n"
-        "1. Точная модель, год и цена.\n"
+        "Проанализируй текст объявления о продаже мопеда/скутера во Вьетнаме. "
+        "Сделай краткую выжимку на русском языке:\n"
+        "1. Точная модель, год и цена (обязательно укажи цену в миллионах донг или VND).\n"
         "2. Состояние техники, мотора и документов.\n"
         "3. Вердикт: стоит ли ехать смотреть.\n\n"
         f"Текст объявления:\n{ad_text}"
@@ -183,16 +176,9 @@ async def analyze_ad_with_gemini(ad_text: str) -> tuple[str, bool]:
             model='gemini-3.5-flash-lite',
             contents=prompt,
         )
-        res_text = response.text.strip()
-        
-        # Проверяем вердикт ИИ по цене
-        if res_text.startswith("REJECTED"):
-            return ("", False)
-            
-        clean_text = res_text.replace("PASSED", "").strip()
-        return (markdown_to_html(clean_text), True)
+        return markdown_to_html(response.text)
     except Exception:
-        return ("Не удалось проанализировать описание.", True)
+        return "Не удалось проанализировать описание."
 
 
 # =====================================================================
@@ -217,7 +203,6 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
         found_ad_urls = []
         for ad in ads:
             href = ad['href']
-            # ТОЛЬКО индивидуальные объявления (содержат -li и оканчиваются на .htm)
             if "-li" in href and re.search(r'\d+\.htm$', href):
                 ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
                 if ad_url not in found_ad_urls and ad_url != CHOTOT_URL:
@@ -255,16 +240,17 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     else:
                         ad_description = full_page_text[:2000]
                     
-                    # 1. Проверка регуляркой
+                    # Извлекаем цену
                     detected_price = extract_price_from_text(full_page_text)
 
-                    if detected_price > MAX_PRICE_VND:
+                    # Если цена надежно определена и она выше 9 млн — отсекаем
+                    if detected_price > 0 and detected_price > MAX_PRICE_VND:
                         sent_ads.add(ad_url)
                         continue
 
-                    # 2. Проверка ИИ (второй рубеж защиты)
-                    ai_summary, passed_ai_price = await analyze_ad_with_gemini(ad_description)
-                    if not passed_ai_price:
+                    # Дополнительный страхующий фильтр для текста (если там явно указано 10-50 млн через tr)
+                    match_high = re.search(r'\b(1[0-9]|[2-9][0-9])\s*(tr|triệu|trieu)\b', full_page_text_lower)
+                    if match_high and detected_price == 0:
                         sent_ads.add(ad_url)
                         continue
 
@@ -273,6 +259,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         sent_ads.pop()
                         
                     new_ads_count += 1
+                    ai_summary = await analyze_ad_with_gemini(ad_description)
                     price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> См. в описании ниже\n"
 
                     text = (
