@@ -187,8 +187,8 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
         found_ad_urls = []
         for ad in ads:
             href = ad['href']
-            # Ищем любые ссылки на объявления в разделе мопедов Дананга
-            if "mua-ban-xe-may" in href and ("-li" in href or "/sitemap/" not in href):
+            # ТОЧНЫЙ фильтр: берем только ссылки, похожие на конкретные объявления (содержат -li или цифры в конце)
+            if "-li" in href or re.search(r'\d+\.htm$', href):
                 ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
                 if ad_url not in found_ad_urls and ad_url != CHOTOT_URL:
                     found_ad_urls.append(ad_url)
@@ -204,20 +204,31 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         continue
                     
                     sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
-                    full_page_text = sub_soup.get_text().lower()
+                    full_page_text = sub_soup.get_text()
+                    full_page_text_lower = full_page_text.lower()
                     
-                    if any(stop_word in full_page_text for stop_word in STOP_WORDS):
-                        sent_ads.add(ad_url)
-                        continue
-                        
-                    if not any(keyword in full_page_text for keyword in ALLOWED_KEYWORDS):
+                    # Пропускаем разделы и категории
+                    if "mua ban xe" in full_page_text_lower and len(full_page_text) < 500:
                         sent_ads.add(ad_url)
                         continue
 
-                    desc_block = sub_soup.find('div', class_=lambda x: x and 'adBody' in x)
-                    ad_description = desc_block.get_text() if desc_block else "Описание отсутствует"
+                    if any(stop_word in full_page_text_lower for stop_word in STOP_WORDS):
+                        sent_ads.add(ad_url)
+                        continue
+                        
+                    if not any(keyword in full_page_text_lower for keyword in ALLOWED_KEYWORDS):
+                        sent_ads.add(ad_url)
+                        continue
+
+                    # Пытаемся найти описание разными способами
+                    desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
+                    if desc_block:
+                        ad_description = desc_block.get_text(separator="\n")
+                    else:
+                        # Если специфического блока нет, берем основной текст страницы (ограничиваем до 2000 символов)
+                        ad_description = full_page_text[:2000]
                     
-                    detected_price = extract_price_from_text(sub_soup.get_text())
+                    detected_price = extract_price_from_text(full_page_text)
 
                     if detected_price > 0 and detected_price > MAX_PRICE_VND:
                         sent_ads.add(ad_url)
@@ -244,7 +255,6 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     logging.error(f"Ошибка при обработке {ad_url}: {sub_e}")
                     continue
                 
-        # Статус при ручной проверке с корректным HTML-форматированием
         if not is_auto:
             if new_ads_count == 0:
                 await bot.send_message(
