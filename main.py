@@ -48,12 +48,18 @@ def save_json_set(filepath, data_set):
 sent_ads = load_json_set(SENT_ADS_FILE)
 favorite_ads = load_json_set(FAV_ADS_FILE)
 
-CHOTOT_URL = "https://www.chotot.com/da-nang/mua-ban-xe-may/50cc"
-MY_CHAT_ID = None
+# Список целевых разделов на Chợ Tốt для Дананга: 50cc, Honda Lead и Honda Air Blade
+CHOTOT_URLS = [
+    "https://www.chotot.com/da-nang/mua-ban-xe-may/50cc",
+    "https://www.chotot.com/da-nang/mua-ban-xe-may/honda/lead",
+    "https://www.chotot.com/da-nang/mua-ban-xe-may/honda/air_blade"
+]
 
+MY_CHAT_ID = None
 user_notifications_active = {}
 
 MAX_PRICE_VND = 9_000_000
+
 ALLOWED_KEYWORDS = ["50cc", "lead", "air blade", "airblade", "cub", "scoopy", "kymco", "today", "giorno", "sym 50"]
 STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua", "đồ chơi"]
 
@@ -105,18 +111,18 @@ async def start_handler(message: types.Message):
     user_notifications_active[message.chat.id] = True
     
     await message.answer(
-        "Привет, Олег! 🛵 Бот настроен и защищен от повторов.\n\n"
+        "Привет, Олег! 🛵 Бот ищет 50cc, Honda Lead и Air Blade строго до 9 млн.\n\n"
         "🎯 <b>Критерии поиска:</b>\n"
         "• Цена: СТРОГО до 9 млн VND\n"
-        "• Модели: 50cc, Honda Lead, Honda Air Blade (и др.)\n"
-        "• Избранное с возможностью удаления активно!",
+        "• Разделы: 50cc + Lead + Air Blade в Дананге\n"
+        "• ИИ-анализ и защита от перекупщиков активны!",
         parse_mode="HTML",
         reply_markup=get_keyboard(message.chat.id)
     )
 
 @dp.message(F.text == "🔍 Проверить байки")
 async def button_check_handler(message: types.Message):
-    await message.answer("🔍 Ищу байки строго до 9 млн VND...")
+    await message.answer("🔍 Сканирую разделы (50cc, Lead, Air Blade) до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
 
 @dp.message(F.text == "⭐ Избранное")
@@ -129,7 +135,6 @@ async def show_favorites_handler(message: types.Message):
     await message.answer("⭐ <b>Твои сохраненные байки:</b>", parse_mode="HTML", reply_markup=get_keyboard(message.chat.id))
     
     for url in list(favorite_ads):
-        # Для каждой ссылки шлем отдельное сообщение с кнопкой удаления, чтобы было удобно управлять
         inline_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{url}")]
@@ -152,15 +157,12 @@ async def toggle_notifications_handler(message: types.Message):
 
 @dp.message(Command("check"))
 async def manual_check_handler(message: types.Message):
-    await message.answer("🔍 Ищу байки строго до 9 млн VND...")
+    await message.answer("🔍 Сканирую разделы (50cc, Lead, Air Blade) до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
 
 @dp.callback_query(F.data.startswith("fav_"))
 async def callback_favorite_handler(callback: types.CallbackQuery):
-    # Достаем закодированный URL или ID из callback_data
     action_data = callback.data.replace("fav_", "", 1)
-    
-    # Ищем исходный URL по хэшу
     target_url = None
     for url in sent_ads:
         ad_id_match = re.search(r'-li(\d+)\.htm', url)
@@ -183,7 +185,6 @@ async def callback_unfavorite_handler(callback: types.CallbackQuery):
         favorite_ads.remove(url_to_remove)
         save_json_set(FAV_ADS_FILE, favorite_ads)
         await callback.answer("🗑 Байк удален из избранного.", show_alert=True)
-        # Удаляем сообщение с этим байком из чата
         try:
             await callback.message.delete()
         except Exception:
@@ -268,23 +269,22 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
 
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        response = requests.get(CHOTOT_URL, headers=headers, timeout=10)
-        
-        if response.status_code != 200:
-            if not is_auto:
-                await bot.send_message(chat_id, f"⚠️ Сайт ответил с ошибкой: {response.status_code}")
-            return
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        ads = soup.find_all('a', href=True)
         
         found_ad_urls = []
-        for ad in ads:
-            href = ad['href']
-            if "-li" in href and re.search(r'\d+\.htm$', href):
-                ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
-                if ad_url not in found_ad_urls and ad_url != CHOTOT_URL:
-                    found_ad_urls.append(ad_url)
+        
+        # Проходим по всем трем ссылкам (50cc, Lead, Air Blade)
+        for url in CHOTOT_URLS:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                continue
+            soup = BeautifulSoup(response.text, 'html.parser')
+            ads = soup.find_all('a', href=True)
+            for ad in ads:
+                href = ad['href']
+                if "-li" in href and re.search(r'\d+\.htm$', href):
+                    ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
+                    if ad_url not in found_ad_urls and ad_url != url:
+                        found_ad_urls.append(ad_url)
         
         total_found_on_page = len(found_ad_urls)
         new_ads_count = 0
@@ -321,6 +321,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     else:
                         ad_description = full_page_text[:2000]
                     
+                    # 1. Извлекаем цену
                     detected_price = extract_price_from_text(full_page_text)
 
                     if detected_price > 0 and detected_price > MAX_PRICE_VND:
@@ -328,8 +329,23 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
 
-                    match_high = re.search(r'\b(1[0-9]|[2-9][0-9])\s*(tr|triệu|trieu)\b', full_page_text_lower)
-                    if match_high and detected_price == 0:
+                    # 2. ИИ-анализ
+                    ai_summary = await analyze_ad_with_gemini(ad_description)
+                    
+                    # 3. Проверка отчета ИИ на дорогие варианты (>9 млн)
+                    ai_summary_lower = ai_summary.lower()
+                    price_matches = re.findall(r'(\d+[\.,]?\d*)\s*(млн|million|tr|триллионов|триллион|трио|triệu|trieu)', ai_summary_lower)
+                    is_expensive = False
+                    for num_str, _ in price_matches:
+                        try:
+                            val = float(num_str.replace(',', '.'))
+                            if val > 9:
+                                is_expensive = True
+                                break
+                        except ValueError:
+                            pass
+                            
+                    if is_expensive:
                         sent_ads.add(ad_url)
                         save_json_set(SENT_ADS_FILE, sent_ads)
                         continue
@@ -340,7 +356,6 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         sent_ads.pop()
                         
                     new_ads_count += 1
-                    ai_summary = await analyze_ad_with_gemini(ad_description)
                     price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> См. в описании ниже\n"
 
                     text = (
@@ -371,9 +386,9 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                 await bot.send_message(
                     chat_id, 
                     f"📊 <b>Результат проверки</b>:\n"
-                    f"• Просканировано объявлений на странице: <b>{total_found_on_page}</b>\n"
-                    f"• Новых подходящих (до 9 млн VND и нужных моделей): <b>0</b>\n\n"
-                    f"<i>Все текущие варианты либо уже проверялись, либо не прошли фильтр цены/модели.</i>",
+                    f"• Просканировано объявлений во всех разделах: <b>{total_found_on_page}</b>\n"
+                    f"• Новых подходящих (до 9 млн VND): <b>0</b>\n\n"
+                    f"<i>Все текущие варианты либо уже проверялись, либо дороже 9 млн.</i>",
                     parse_mode="HTML",
                     reply_markup=get_keyboard(chat_id)
                 )
