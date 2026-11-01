@@ -230,10 +230,6 @@ async def auto_check_loop():
 async def main():
     print("Бот и веб-сервер запускаются...")
     await set_main_menu(bot)
-    await start_web_server()  # Запускаем мини веб-сервер для Render
-    async def main():
-    print("Бот и веб-сервер запускаются...")
-    await set_main_menu(bot)
     
     # Запускаем веб-сервер параллельно в фоне, чтобы Render был доволен
     asyncio.create_task(start_web_server())
