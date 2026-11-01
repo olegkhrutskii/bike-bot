@@ -181,10 +181,22 @@ async def callback_show_details_handler(callback: types.CallbackQuery):
     if target_url and target_info:
         await callback.answer("🤖 Генерирую анализ Gemini...")
         
-        # Если анализ еще не делался, запрашиваем его у ИИ прямо сейчас по клику
         ai_summary = target_info.get("summary")
         if not ai_summary:
-            ai_summary = await analyze_ad_with_gemini(target_info.get("description", ""))
+            desc = target_info.get("description", "")
+            if not desc:
+                # Если описания не было, быстренько подгружаем текст страницы заново
+                try:
+                    sub_resp = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                    if sub_resp.status_code == 200:
+                        sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
+                        desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
+                        desc = desc_block.get_text(separator="\n") if desc_block else sub_soup.get_text()[:2000]
+                        target_info["description"] = desc
+                except Exception:
+                    pass
+
+            ai_summary = await analyze_ad_with_gemini(desc if desc else "Описание отсутствует")
             target_info["summary"] = ai_summary
             save_json_data(SENT_TITLES_FILE, sent_details)
 
@@ -323,7 +335,8 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
             timeout=15.0
         )
         return markdown_to_html(response.text)
-    except Exception:
+    except Exception as e:
+        logging.error(f"Ошибка Gemini API: {e}")
         return "Не удалось проанализировать описание."
 
 
@@ -382,19 +395,17 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                 if detected_price > 0 and detected_price > MAX_PRICE_VND:
                     continue
 
-                # Достаем заголовок прямо со страницы (без обращения к Gemini при сканировании)
                 title_tag = sub_soup.find('h1')
                 clean_title = title_tag.get_text().strip() if title_tag else "Байк до 9 млн VND"
                 clean_title = clean_title[:60]
                 
                 current_batch_scanned.append((ad_url, clean_title, detected_price))
 
-                # Сохраняем сырые данные для отложенного анализа по кнопке
                 sent_details[ad_url] = {
                     "title": clean_title,
                     "price": detected_price,
                     "description": ad_description,
-                    "summary": None # Сгенерируется по клику
+                    "summary": None
                 }
 
                 if ad_url not in sent_ads:
@@ -434,14 +445,10 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
             
             await bot.send_message(chat_id, report_text, parse_mode="HTML", reply_markup=get_keyboard(chat_id))
 
+            # В сводном списке убрали кнопки «Подробнее», теперь выводим просто чистый список с ценами
             for url, title, price in current_batch_scanned:
                 price_str = f"{price:,} VND" if price > 0 else "Цена в описании"
-                inline_kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="🤖 Подробнее", callback_data=f"show_{hash(url)}")]
-                    ]
-                )
-                await bot.send_message(chat_id, f"🛵 <b>{title}</b>\n💰 {price_str}", parse_mode="HTML", reply_markup=inline_kb)
+                await bot.send_message(chat_id, f"🛵 <b>{title}</b>\n💰 {price_str}\n🔗 {url}", parse_mode="HTML")
                 await asyncio.sleep(0.2)
             
     except Exception as e:
