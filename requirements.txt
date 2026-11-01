@@ -2,3 +2,4 @@ aiogram
 google-genai
 requests
 beautifulsoup4
+aiohttp
