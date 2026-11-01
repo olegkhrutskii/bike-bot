@@ -108,10 +108,10 @@ async def start_handler(message: types.Message):
     
     await message.answer(
         "Привет, Олег! 🛵 Бот готов к работе.\n\n"
-        "🎯 <b>Возможности:</b>\n"
-        "• Поиск байков до 9 млн VND\n"
-        "• Компактный список результатов с кнопками\n"
-        "• Команда /reset для сброса памяти",
+        "🎯 <b>Особенности:</b>\n"
+        "• Быстрое сканирование без задержек\n"
+        "• ИИ-анализ по клику на кнопку «🤖 Подробнее»\n"
+        "• Удобное избранное",
         parse_mode="HTML",
         reply_markup=get_keyboard(message.chat.id)
     )
@@ -119,7 +119,7 @@ async def start_handler(message: types.Message):
 @dp.message(F.text == "🔍 Проверить байки")
 @dp.message(Command("check"))
 async def manual_check_handler(message: types.Message):
-    await message.answer("🔍 Ищу байки до 9 млн VND...")
+    await message.answer("🔍 Быстро сканирую байки до 9 млн VND...")
     await check_chotot_and_notify(message.chat.id)
 
 @dp.message(F.text == "⭐ Избранное")
@@ -134,13 +134,16 @@ async def show_favorites_handler(message: types.Message):
     for url in list(favorite_ads):
         info = sent_details.get(url, {})
         title = info.get("title", "Байк из избранного")
+        price = info.get("price", 0)
+        price_str = f"{price:,} VND" if price > 0 else "Цена в описании"
+        
         inline_kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔍 Показать детали", callback_data=f"show_{hash(url)}")],
+                [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{hash(url)}")],
                 [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{hash(url)}")]
             ]
         )
-        await message.answer(f"🛵 <b>{title}</b>", parse_mode="HTML", reply_markup=inline_kb)
+        await message.answer(f"🛵 <b>{title}</b>\n💰 {price_str}", parse_mode="HTML", reply_markup=inline_kb)
         await asyncio.sleep(0.2)
 
 @dp.message(Command("reset"))
@@ -176,9 +179,17 @@ async def callback_show_details_handler(callback: types.CallbackQuery):
             break
             
     if target_url and target_info:
+        await callback.answer("🤖 Генерирую анализ Gemini...")
+        
+        # Если анализ еще не делался, запрашиваем его у ИИ прямо сейчас по клику
+        ai_summary = target_info.get("summary")
+        if not ai_summary:
+            ai_summary = await analyze_ad_with_gemini(target_info.get("description", ""))
+            target_info["summary"] = ai_summary
+            save_json_data(SENT_TITLES_FILE, sent_details)
+
         price = target_info.get("price", 0)
         price_info = f"💰 <b>Цена:</b> {price:,} VND\n" if price > 0 else "💰 <b>Цена:</b> См. в описании\n"
-        ai_summary = target_info.get("summary", "Анализ недоступен.")
         
         text = (
             f"🔥 <b>Детали байка:</b>\n\n"
@@ -193,7 +204,6 @@ async def callback_show_details_handler(callback: types.CallbackQuery):
             ]
         )
         await callback.message.answer(text, parse_mode="HTML", reply_markup=inline_kb)
-        await callback.answer("Готово!")
     else:
         await callback.answer("⚠️ Информация не найдена.", show_alert=True)
 
@@ -238,7 +248,6 @@ async def callback_unfavorite_handler(callback: types.CallbackQuery):
 async def chat_handler(message: types.Message):
     await message.bot.send_chat_action(message.chat.id, "typing")
     try:
-        # Неблокирующий вызов Gemini
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None, 
@@ -295,12 +304,10 @@ def fetch_url(url: str, timeout: int = 5):
 async def analyze_ad_with_gemini(ad_text: str) -> str:
     prompt = (
         "Проанализируй текст объявления о продаже мопеда/скутера во Вьетнаме.\n"
-        "ВАЖНО: Самой первой строчкой без каких-либо вводных слов или номеров пунктов напиши краткое название в формате: "
-        "<Модель> <Год> (<Цена в млн донг или VND>).\n"
-        "Например: Honda Lead 2009 (4.5 млн VND) или Yamaha Mio 2011 (6 млн VND).\n\n"
-        "Далее напиши краткую выжимку:\n"
-        "• Состояние техники, мотора и документов.\n"
-        "• Вердикт: стоит ли ехать смотреть.\n\n"
+        "Напиши краткую выжимку на русском языке:\n"
+        "1. Точная модель, год и цена (в миллионах донг или VND).\n"
+        "2. Состояние техники, мотора и документов.\n"
+        "3. Вердикт: стоит ли ехать смотреть.\n\n"
         f"Текст объявления:\n{ad_text}"
     )
     try:
@@ -313,7 +320,7 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
                     contents=prompt,
                 )
             ),
-            timeout=15.0 # Защита от бесконечного зависания API
+            timeout=15.0
         )
         return markdown_to_html(response.text)
     except Exception:
@@ -351,7 +358,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
         new_ads_count = 0
         current_batch_scanned = []
 
-        for ad_url in found_ad_urls[:10]: # Ограничиваем сканирование первыми 10 элементами для скорости
+        for ad_url in found_ad_urls[:10]:
             try:
                 sub_resp = await loop.run_in_executor(None, lambda: fetch_url(ad_url, 5))
                 if sub_resp.status_code != 200:
@@ -375,41 +382,38 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                 if detected_price > 0 and detected_price > MAX_PRICE_VND:
                     continue
 
-                ai_summary = await analyze_ad_with_gemini(ad_description)
-                
-                lines = [line.strip() for line in ai_summary.split('\n') if line.strip()]
-                clean_title = lines[0].replace('<b>', '').replace('</b>', '').replace('•', '').strip() if lines else "Байк до 9 млн"
+                # Достаем заголовок прямо со страницы (без обращения к Gemini при сканировании)
+                title_tag = sub_soup.find('h1')
+                clean_title = title_tag.get_text().strip() if title_tag else "Байк до 9 млн VND"
                 clean_title = clean_title[:60]
                 
-                current_batch_scanned.append((ad_url, clean_title))
+                current_batch_scanned.append((ad_url, clean_title, detected_price))
+
+                # Сохраняем сырые данные для отложенного анализа по кнопке
+                sent_details[ad_url] = {
+                    "title": clean_title,
+                    "price": detected_price,
+                    "description": ad_description,
+                    "summary": None # Сгенерируется по клику
+                }
 
                 if ad_url not in sent_ads:
                     sent_ads.add(ad_url)
                     new_ads_count += 1
                     
-                    price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> См. в описании ниже\n"
-
-                    text = (
-                        f"🔥 <b>Новый байк до 9 млн на Chợ Tốt!</b>\n\n"
-                        f"{price_info}"
-                        f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}\n\n"
-                        f"🔗 {ad_url}"
-                    )
+                    price_str = f"{detected_price:,} VND" if detected_price > 0 else "Цена в описании"
+                    text = f"🔥 <b>Новый байк до 9 млн!</b>\n🛵 {clean_title}\n💰 {price_str}\n🔗 {ad_url}"
                     
                     inline_kb = InlineKeyboardMarkup(
                         inline_keyboard=[
+                            [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{hash(ad_url)}")],
                             [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{hash(ad_url)}")]
                         ]
                     )
                     
                     await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=inline_kb)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
 
-                sent_details[ad_url] = {
-                    "title": clean_title,
-                    "price": detected_price,
-                    "summary": ai_summary
-                }
                 save_json_data(SENT_TITLES_FILE, sent_details)
                 save_json_data(SENT_ADS_FILE, sent_ads)
 
@@ -430,17 +434,18 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
             
             await bot.send_message(chat_id, report_text, parse_mode="HTML", reply_markup=get_keyboard(chat_id))
 
-            for url, title in current_batch_scanned:
+            for url, title, price in current_batch_scanned:
+                price_str = f"{price:,} VND" if price > 0 else "Цена в описании"
                 inline_kb = InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [InlineKeyboardButton(text="🔍 Показать детали", callback_data=f"show_{hash(url)}")]
+                        [InlineKeyboardButton(text="🤖 Подробнее", callback_data=f"show_{hash(url)}")]
                     ]
                 )
-                await bot.send_message(chat_id, f"🛵 <b>{title}</b>", parse_mode="HTML", reply_markup=inline_kb)
+                await bot.send_message(chat_id, f"🛵 <b>{title}</b>\n💰 {price_str}", parse_mode="HTML", reply_markup=inline_kb)
                 await asyncio.sleep(0.2)
             
     except Exception as e:
-        logging.error(f"Ошибка при парсинге: {e}")
+        logging.error(f"Ошибка при парсинг-цикле: {e}")
 
 
 # =====================================================================
