@@ -32,13 +32,13 @@ MY_CHAT_ID = None
 user_notifications_active = {}
 
 MAX_PRICE_VND = 9_000_000
-# Удалили общий "sym", чтобы не пропускать 125-кубовые Attila и т.д.
+# Только 50cc и конкретные небольшие модели (убрали общий sym, чтобы не брать 125cc)
 ALLOWED_KEYWORDS = ["50cc", "lead", "air blade", "airblade", "cub", "scoopy", "kymco", "today", "giorno", "sym 50"]
 STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua", "đồ chơi"]
 
 
 # =====================================================================
-# 2. МИНИ-ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER
+# 2. МИНИ-ВЕБ-СЕРВЕР ДЛЯ RENDER
 # =====================================================================
 async def handle_ping(request):
     return web.Response(text="Bike Bot is running 24/7!")
@@ -84,10 +84,11 @@ async def start_handler(message: types.Message):
     
     await message.answer(
         "Привет, Олег! 🛵 Жесткий фильтр по цене включен.\n\n"
-        "🎯 **Критерии поиска**:\n"
+        "🎯 <b>Критерии поиска:</b>\n"
         "• Цена: СТРОГО до 9 млн VND\n"
         "• Модели: 50cc, Honda Lead, Honda Air Blade (и др.)\n"
         "• ИИ-анализ каждого подходящего объявления активен!",
+        parse_mode="HTML",
         reply_markup=get_keyboard(message.chat.id)
     )
 
@@ -138,27 +139,36 @@ def extract_price_from_text(text: str) -> int:
         except ValueError:
             pass
 
-    numbers = re.findall(r'\b\d[\d\.,]{5,}\b', text)
+    numbers = re.findall(r'\b\d[\d\.,]{6,}\b', text)
     for num_str in numbers:
         clean_num = re.sub(r'[^\d]', '', num_str)
         if clean_num:
             val = int(clean_num)
             if 1_000_000 <= val <= 99_000_000:
                 return val
+
+    match_digits = re.search(r'(\d{1,2})\s*(triệu|tr|trieu)', text, re.IGNORECASE)
+    if match_digits:
+        try:
+            return int(match_digits.group(1)) * 1_000_000
+        except ValueError:
+            pass
+
     return 0
 
 def markdown_to_html(text: str) -> str:
-    # Конвертируем маркдаун звездочки Gemini в HTML-теги для красивого жирного текста в Телеграме
+    # Превращаем звездочки Gemini в HTML-теги для красивого жирного текста в Telegram
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'^\*\s+', r'• ', text, flags=re.MULTILINE)
     return text
 
 async def analyze_ad_with_gemini(ad_text: str) -> str:
     prompt = (
         "Проанализируй текст объявления о продаже мопеда/скутера во Вьетнаме. "
         "Сделай краткую выжимку на русском языке:\n"
-        "1. Точная модель, год и цена.\n"
+        "1. Точная модель, год и цена (обязательно укажи цену в миллионах донг или VND).\n"
         "2. Состояние техники, мотора и документов.\n"
-        "3. Стоит ли ехать смотреть.\n\n"
+        "3. Вердикт: стоит ли ехать смотреть.\n\n"
         f"Текст объявления:\n{ad_text}"
     )
     try:
@@ -166,7 +176,6 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
             model='gemini-3.5-flash-lite',
             contents=prompt,
         )
-        # Очищаем от звездочек маркдауна перед выдачей
         return markdown_to_html(response.text)
     except Exception:
         return "Не удалось проанализировать описание."
@@ -233,6 +242,12 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     
                     detected_price = extract_price_from_text(full_page_text)
 
+                    # Фильтр крупных сумм: если цифры 10-50 млн прописаны рядом со словами tr/triệu — сбрасываем
+                    match_high = re.search(r'\b(1[0-9]|[2-9][0-9])\s*(tr|triệu|trieu)\b', full_page_text_lower)
+                    if match_high:
+                        sent_ads.add(ad_url)
+                        continue
+
                     if detected_price > 0 and detected_price > MAX_PRICE_VND:
                         sent_ads.add(ad_url)
                         continue
@@ -243,7 +258,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                         
                     new_ads_count += 1
                     ai_summary = await analyze_ad_with_gemini(ad_description)
-                    price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> Уточняйте в объявлении\n"
+                    price_info = f"💰 <b>Цена:</b> {detected_price:,} VND\n" if detected_price > 0 else "💰 <b>Цена:</b> См. в описании ниже\n"
 
                     text = (
                         f"🔥 <b>Подходящий байк (до 9 млн) на Chợ Tốt!</b>\n\n"
