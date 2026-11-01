@@ -231,14 +231,18 @@ async def main():
     print("Бот и веб-сервер запускаются...")
     await set_main_menu(bot)
     await start_web_server()  # Запускаем мини веб-сервер для Render
+    async def main():
+    print("Бот и веб-сервер запускаются...")
+    await set_main_menu(bot)
+    
+    # Запускаем веб-сервер параллельно в фоне, чтобы Render был доволен
+    asyncio.create_task(start_web_server())
+    
+    # Запускаем автопроверку байков
     asyncio.create_task(auto_check_loop())
     
-    while True:
-        try:
-            await dp.start_polling(bot)
-        except Exception as e:
-            logging.error(f"Связь прервалась: {e}. Переподключение...")
-            await asyncio.sleep(3)
+    # Запуск самого бота
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
