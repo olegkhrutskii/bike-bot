@@ -174,7 +174,8 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
 
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(CHOTOT_URL, headers=headers)
+        response = requests.get(CHOTOT_URL, headers=headers, timeout=10)
+        
         if response.status_code != 200:
             if not is_auto:
                 await bot.send_message(chat_id, f"⚠️ Сайт ответил с ошибкой: {response.status_code}")
@@ -183,61 +184,83 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
         soup = BeautifulSoup(response.text, 'html.parser')
         ads = soup.find_all('a', href=True)
         
-        new_ads_count = 0
+        # Собираем все уникальные ссылки на объявления с текущей страницы
+        found_ad_urls = []
         for ad in ads:
             href = ad['href']
             if "/da-nang/mua-ban-xe-may/" in href and "-li" in href:
                 ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
-                
-                if ad_url not in sent_ads:
-                    try:
-                        sub_resp = requests.get(ad_url, headers=headers, timeout=5)
-                        if sub_resp.status_code != 200:
-                            continue
-                        
-                        sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
-                        full_page_text = sub_soup.get_text().lower()
-                        
-                        if any(stop_word in full_page_text for stop_word in STOP_WORDS):
-                            sent_ads.add(ad_url)
-                            continue
-                            
-                        if not any(keyword in full_page_text for keyword in ALLOWED_KEYWORDS):
-                            sent_ads.add(ad_url)
-                            continue
+                if ad_url not in found_ad_urls:
+                    found_ad_urls.append(ad_url)
+        
+        total_found_on_page = len(found_ad_urls)
+        new_ads_count = 0
 
-                        desc_block = sub_soup.find('div', class_=lambda x: x and 'adBody' in x)
-                        ad_description = desc_block.get_text() if desc_block else "Описание отсутствует"
-                        
-                        detected_price = extract_price_from_text(sub_soup.get_text())
-
-                        if detected_price > 0 and detected_price > MAX_PRICE_VND:
-                            sent_ads.add(ad_url)
-                            continue
-
-                        sent_ads.add(ad_url)
-                        if len(sent_ads) > 500:
-                            sent_ads.pop()
-                            
-                        new_ads_count += 1
-                        ai_summary = await analyze_ad_with_gemini(ad_description)
-                        price_info = f"💰 **Цена:** {detected_price:,} VND\n" if detected_price > 0 else "💰 **Цена:** Уточняйте в объявлении\n"
-
-                        text = (
-                            f"🔥 **Подходящий байк (до 9 млн) на Chợ Tốt!**\n\n"
-                            f"{price_info}"
-                            f"🤖 **Анализ Gemini:**\n{ai_summary}\n\n"
-                            f"🔗 {ad_url}"
-                        )
-                        await bot.send_message(chat_id, text, reply_markup=get_keyboard(chat_id))
-                        await asyncio.sleep(2)
-
-                    except Exception as sub_e:
-                        logging.error(f"Ошибка при обработке {ad_url}: {sub_e}")
+        for ad_url in found_ad_urls:
+            if ad_url not in sent_ads:
+                try:
+                    sub_resp = requests.get(ad_url, headers=headers, timeout=5)
+                    if sub_resp.status_code != 200:
                         continue
                     
-        if new_ads_count == 0 and not is_auto:
-            await bot.send_message(chat_id, "📭 Новых вариантов строго до 9 млн VND с нужными моделями пока нет.", reply_markup=get_keyboard(chat_id))
+                    sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
+                    full_page_text = sub_soup.get_text().lower()
+                    
+                    # 1. Проверка на стоп-слова
+                    if any(stop_word in full_page_text for stop_word in STOP_WORDS):
+                        sent_ads.add(ad_url)
+                        continue
+                        
+                    # 2. Проверка на ключевые слова моделей
+                    if not any(keyword in full_page_text for keyword in ALLOWED_KEYWORDS):
+                        sent_ads.add(ad_url)
+                        continue
+
+                    # 3. Извлечение описания и цены
+                    desc_block = sub_soup.find('div', class_=lambda x: x and 'adBody' in x)
+                    ad_description = desc_block.get_text() if desc_block else "Описание отсутствует"
+                    
+                    detected_price = extract_price_from_text(sub_soup.get_text())
+
+                    # 4. Проверка цены (строго до 9 млн VND)
+                    if detected_price > 0 and detected_price > MAX_PRICE_VND:
+                        sent_ads.add(ad_url)
+                        continue
+
+                    # Если всё прошло — добавляем в отправленные
+                    sent_ads.add(ad_url)
+                    if len(sent_ads) > 500:
+                        sent_ads.pop()
+                        
+                    new_ads_count += 1
+                    ai_summary = await analyze_ad_with_gemini(ad_description)
+                    price_info = f"💰 **Цена:** {detected_price:,} VND\n" if detected_price > 0 else "💰 **Цена:** Уточняйте в объявлении\n"
+
+                    text = (
+                        f"🔥 **Подходящий байк (до 9 млн) на Chợ Tốt!**\n\n"
+                        f"{price_info}"
+                        f"🤖 **Анализ Gemini:**\n{ai_summary}\n\n"
+                        f"🔗 {ad_url}"
+                    )
+                    await bot.send_message(chat_id, text, reply_markup=get_keyboard(chat_id))
+                    await asyncio.sleep(2)
+
+                except Exception as sub_e:
+                    logging.error(f"Ошибка при обработке {ad_url}: {sub_e}")
+                    continue
+                
+        # Подробный статус при ручной проверке
+        if not is_auto:
+            if new_ads_count == 0:
+                await bot.send_message(
+                    chat_id, 
+                    f"📊 **Результат проверки**:\n"
+                    f"• Просканировано объявлений на первой странице: **{total_found_on_page}**\n"
+                    f"• Новых подходящих (до 9 млн VND и нужных моделей): **0**\n\n"
+                    f"<i>Все текущие варианты либо уже проверялись, либо не прошли фильтр цены/модели.</i>",
+                    parse_mode="HTML",
+                    reply_markup=get_keyboard(chat_id)
+                )
             
     except Exception as e:
         logging.error(f"Ошибка при парсинге: {e}")
