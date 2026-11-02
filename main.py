@@ -256,21 +256,29 @@ async def callback_unfavorite_handler(callback: types.CallbackQuery):
         except Exception:
             pass
 
-@dp.message()
+@dp.message(F.text & ~F.text.startswith("/"))
 async def chat_handler(message: types.Message):
+    # Пропускаем служебные тексты кнопок, если они случайно попали сюда
+    if message.text in ["🔍 Проверить байки", "⭐ Избранное", "🔕 Выключить уведомления", "🔔 Включить уведомления"]:
+        return
+
     await message.bot.send_chat_action(message.chat.id, "typing")
     try:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, 
-            lambda: client.models.generate_content(
-                model='gemini-3.5-flash-lite',
-                contents=message.text,
-            )
+        response = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, 
+                lambda: client.models.generate_content(
+                    model='gemini-3.5-flash-lite',
+                    contents=message.text,
+                )
+            ),
+            timeout=15.0
         )
         await message.answer(response.text)
     except Exception as e:
-        await message.answer(f"Ошибка ответа: {e}")
+        logging.error(f"Ошибка Gemini в чате: {e}")
+        await message.answer("⚠️ Не удалось получить ответ от Gemini. Попробуй еще раз через пару секунд.")
 
 
 # =====================================================================
