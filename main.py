@@ -3,12 +3,17 @@ import asyncio
 import logging
 import json
 import re
+import html
+import hashlib
 import requests
 from bs4 import BeautifulSoup
 from google import genai
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    BotCommand, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from aiohttp import web
 
 # =====================================================================
@@ -20,43 +25,105 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Не найдены ключи TELEGRAM_TOKEN или GEMINI_API_KEY")
 
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 logging.basicConfig(level=logging.INFO)
 
-SENT_ADS_FILE = "sent_ads.json"
-FAV_ADS_FILE = "favorites.json"
-SENT_TITLES_FILE = "sent_titles.json"
+# Если подключишь Render Disk, укажи DATA_DIR=/data (путь монтирования диска).
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def load_json_data(filepath, default_type):
+SENT_ADS_FILE = os.path.join(DATA_DIR, "sent_ads.json")
+FAV_ADS_FILE = os.path.join(DATA_DIR, "favorites.json")
+SENT_TITLES_FILE = os.path.join(DATA_DIR, "sent_titles.json")
+CHAT_FILE = os.path.join(DATA_DIR, "chat.json")
+
+CHOTOT_URL = "https://www.chotot.com/da-nang/mua-ban-xe-may?price=0-9000000"
+MAX_PRICE_VND = 9_000_000
+MAX_ADS_PER_SCAN = 10
+MAX_SENT_ADS = 500
+MAX_DETAILS = 500
+STOP_WORDS = [
+    "phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua",
+    "đồ chơi", "cho thue", "phu tung",
+]
+
+
+def load_json(filepath, default):
     if os.path.exists(filepath):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return default_type(data)
-        except Exception:
-            pass
-    return default_type()
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Не удалось прочитать {filepath}: {e}")
+    return default
 
-def save_json_data(filepath, data):
+
+def save_json(filepath, data):
     try:
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(list(data) if isinstance(data, set) else data, f, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         logging.error(f"Ошибка сохранения файла {filepath}: {e}")
 
-sent_ads = load_json_data(SENT_ADS_FILE, set)
-favorite_ads = load_json_data(FAV_ADS_FILE, set)
-sent_details = load_json_data(SENT_TITLES_FILE, dict)
 
-CHOTOT_URL = "https://www.chotot.com/da-nang/mua-ban-xe-may?price=0-9000000"
+# sent_ads и favorite_ads: dict (url -> True), чтобы сохранялся порядок добавления.
+sent_ads: dict = dict.fromkeys(load_json(SENT_ADS_FILE, []), True)
+favorite_ads: dict = dict.fromkeys(load_json(FAV_ADS_FILE, []), True)
+sent_details: dict = load_json(SENT_TITLES_FILE, {})
 
-MY_CHAT_ID = None
+MY_CHAT_ID = load_json(CHAT_FILE, {}).get("chat_id")
 user_notifications_active = {}
-MAX_PRICE_VND = 9_000_000
-STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua", "đồ chơi", "cho thue", "phu tung"]
+scan_lock = asyncio.Lock()
+
+
+def save_sent():
+    save_json(SENT_ADS_FILE, list(sent_ads))
+
+
+def save_favs():
+    save_json(FAV_ADS_FILE, list(favorite_ads))
+
+
+def save_details():
+    save_json(SENT_TITLES_FILE, sent_details)
+
+
+def trim_state():
+    """Удаляет самые старые записи, избранное не трогает."""
+    while len(sent_ads) > MAX_SENT_ADS:
+        del sent_ads[next(iter(sent_ads))]
+    if len(sent_details) > MAX_DETAILS:
+        for url in list(sent_details):
+            if len(sent_details) <= MAX_DETAILS:
+                break
+            if url not in favorite_ads:
+                del sent_details[url]
+
+
+def uid(url: str) -> str:
+    """Стабильный идентификатор для callback_data (hash() меняется при каждом запуске)."""
+    return hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
+
+
+def find_url(h: str, *collections):
+    for coll in collections:
+        for url in coll:
+            if uid(url) == h:
+                return url
+    return None
+
+
+def fmt_price(price) -> str:
+    return f"{price:,} VND" if price and price > 0 else "Цена в описании"
+
+
+def esc(text) -> str:
+    return html.escape(str(text), quote=False)
 
 
 # =====================================================================
@@ -64,6 +131,7 @@ STOP_WORDS = ["phụ tùng", "thế chấp", "cho thuê", "cần mua", "thu mua"
 # =====================================================================
 async def handle_ping(request):
     return web.Response(text="Bike Bot is running 24/7!")
+
 
 async def start_web_server():
     app = web.Application()
@@ -77,249 +145,116 @@ async def start_web_server():
 
 
 # =====================================================================
-# 3. КНОПКИ И ОБРАБОТЧИКИ
+# 3. ПАРСИНГ, ЦЕНА, GEMINI
 # =====================================================================
-async def set_main_menu(bot: Bot):
-    main_commands = [
-        BotCommand(command="start", description="🚀 Перезапустить бота"),
-        BotCommand(command="check", description="🔍 Проверить новые байки"),
-        BotCommand(command="favorites", description="⭐ Избранные байки"),
-        BotCommand(command="reset", description="🔄 Сбросить память"),
-    ]
-    await bot.set_my_commands(main_commands)
-
-def get_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
-    is_active = user_notifications_active.get(chat_id, True)
-    toggle_text = "🔕 Выключить уведомления" if is_active else "🔔 Включить уведомления"
-    
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Проверить байки"), KeyboardButton(text="⭐ Избранное")],
-            [KeyboardButton(text=toggle_text)]
-        ],
-        resize_keyboard=True
-    )
-
-@dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    global MY_CHAT_ID
-    MY_CHAT_ID = message.chat.id
-    user_notifications_active[message.chat.id] = True
-    
-    await message.answer(
-        "Привет, Олег! 🛵 Бот готов к работе.\n\n"
-        "🎯 <b>Особенности:</b>\n"
-        "• Быстрое сканирование без задержек\n"
-        "• ИИ-анализ по клику на кнопку «🤖 Подробнее»\n"
-        "• Удобное избранное",
-        parse_mode="HTML",
-        reply_markup=get_keyboard(message.chat.id)
-    )
-
-@dp.message(F.text == "🔍 Проверить байки")
-@dp.message(Command("check"))
-async def manual_check_handler(message: types.Message):
-    await message.answer("🔍 Быстро сканирую байки до 9 млн VND...")
-    await check_chotot_and_notify(message.chat.id)
-
-@dp.message(F.text == "⭐ Избранное")
-@dp.message(Command("favorites"))
-async def show_favorites_handler(message: types.Message):
-    if not favorite_ads:
-        await message.answer("⭐ У тебя пока нет сохраненных байков в избранном.", reply_markup=get_keyboard(message.chat.id))
-        return
-    
-    await message.answer("⭐ <b>Твои сохраненные байки:</b>", parse_mode="HTML", reply_markup=get_keyboard(message.chat.id))
-    
-    for url in list(favorite_ads):
-        info = sent_details.get(url, {})
-        title = info.get("title", "Байк из избранного")
-        price = info.get("price", 0)
-        price_str = f"{price:,} VND" if price > 0 else "Цена в описании"
-        
-        inline_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{hash(url)}")],
-                [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{hash(url)}")]
-            ]
-        )
-        await message.answer(f"🛵 <b>{title}</b>\n💰 {price_str}", parse_mode="HTML", reply_markup=inline_kb)
-        await asyncio.sleep(0.2)
-
-@dp.message(Command("reset"))
-async def reset_history_handler(message: types.Message):
-    global sent_ads, sent_details
-    sent_ads.clear()
-    sent_details.clear()
-    save_json_data(SENT_ADS_FILE, sent_ads)
-    save_json_data(SENT_TITLES_FILE, sent_details)
-    await message.answer("🔄 Память сброшена!", reply_markup=get_keyboard(message.chat.id))
-
-@dp.message(F.text.in_(["🔕 Выключить уведомления", "🔔 Включить уведомления"]))
-async def toggle_notifications_handler(message: types.Message):
-    chat_id = message.chat.id
-    current_state = user_notifications_active.get(chat_id, True)
-    new_state = not current_state
-    user_notifications_active[chat_id] = new_state
-    
-    if new_state:
-        await message.answer("🔔 Уведомления включены!", reply_markup=get_keyboard(chat_id))
-    else:
-        await message.answer("🔕 Уведомления выключены.", reply_markup=get_keyboard(chat_id))
-
-@dp.callback_query(F.data.startswith("show_"))
-async def callback_show_details_handler(callback: types.CallbackQuery):
-    h_str = callback.data.replace("show_", "", 1)
-    target_url = None
-    target_info = None
-    for url, info in sent_details.items():
-        if str(hash(url)) == h_str:
-            target_url = url
-            target_info = info
-            break
-            
-    if target_url and target_info:
-        await callback.answer("🤖 Генерирую анализ Gemini...")
-        
-        ai_summary = target_info.get("summary")
-        if not ai_summary:
-            desc = target_info.get("description", "")
-            if not desc:
-                # Если описания не было, быстренько подгружаем текст страницы заново
-                try:
-                    sub_resp = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-                    if sub_resp.status_code == 200:
-                        sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
-                        desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
-                        desc = desc_block.get_text(separator="\n") if desc_block else sub_soup.get_text()[:2000]
-                        target_info["description"] = desc
-                except Exception:
-                    pass
-
-            ai_summary = await analyze_ad_with_gemini(desc if desc else "Описание отсутствует")
-            target_info["summary"] = ai_summary
-            save_json_data(SENT_TITLES_FILE, sent_details)
-
-        price = target_info.get("price", 0)
-        price_info = f"💰 <b>Цена:</b> {price:,} VND\n" if price > 0 else "💰 <b>Цена:</b> См. в описании\n"
-        
-        text = (
-            f"🔥 <b>Детали байка:</b>\n\n"
-            f"{price_info}"
-            f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}\n\n"
-            f"🔗 {target_url}"
-        )
-        
-        inline_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{hash(target_url)}")]
-            ]
-        )
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=inline_kb)
-    else:
-        await callback.answer("⚠️ Информация не найдена.", show_alert=True)
-
-@dp.callback_query(F.data.startswith("fav_"))
-async def callback_favorite_handler(callback: types.CallbackQuery):
-    h_str = callback.data.replace("fav_", "", 1)
-    target_url = None
-    for url in sent_details:
-        if str(hash(url)) == h_str:
-            target_url = url
-            break
-            
-    if target_url:
-        if target_url not in favorite_ads:
-            favorite_ads.add(target_url)
-            save_json_data(FAV_ADS_FILE, favorite_ads)
-            await callback.answer("⭐ Добавлено в избранное!", show_alert=True)
-        else:
-            await callback.answer("⭐ Уже в избранном.", show_alert=True)
-    else:
-        await callback.answer("⚠️ Ссылка не найдена.", show_alert=True)
-
-@dp.callback_query(F.data.startswith("unfav_"))
-async def callback_unfavorite_handler(callback: types.CallbackQuery):
-    h_str = callback.data.replace("unfav_", "", 1)
-    target_url = None
-    for url in favorite_ads:
-        if str(hash(url)) == h_str:
-            target_url = url
-            break
-            
-    if target_url and target_url in favorite_ads:
-        favorite_ads.remove(target_url)
-        save_json_data(FAV_ADS_FILE, favorite_ads)
-        await callback.answer("🗑 Удалено из избранного.", show_alert=True)
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-
-@dp.message(F.text & ~F.text.startswith("/"))
-async def chat_handler(message: types.Message):
-    # Пропускаем служебные тексты кнопок, если они случайно попали сюда
-    if message.text in ["🔍 Проверить байки", "⭐ Избранное", "🔕 Выключить уведомления", "🔔 Включить уведомления"]:
-        return
-
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    try:
-        loop = asyncio.get_event_loop()
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                None, 
-                lambda: client.models.generate_content(
-                    model='gemini-3.5-flash-lite',
-                    contents=message.text,
-                )
-            ),
-            timeout=15.0
-        )
-        await message.answer(response.text)
-    except Exception as e:
-        logging.error(f"Ошибка Gemini в чате: {e}")
-        await message.answer("⚠️ Не удалось получить ответ от Gemini. Попробуй еще раз через пару секунд.")
-
-
-# =====================================================================
-# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =====================================================================
-def extract_price_from_text(text: str) -> int:
-    match_tr = re.search(r'(\d+[\.,]?\d*)\s*(tr|triệu|trieu)', text, re.IGNORECASE)
-    if match_tr:
-        num_str = match_tr.group(1).replace(',', '.')
-        try:
-            return int(float(num_str) * 1_000_000)
-        except ValueError:
-            pass
-
-    match_tr_split = re.search(r'(\d+)tr(\d+)', text, re.IGNORECASE)
-    if match_tr_split:
-        try:
-            whole = match_tr_split.group(1)
-            frac = match_tr_split.group(2)
-            return int(float(f"{whole}.{frac}") * 1_000_000)
-        except ValueError:
-            pass
-
-    numbers = re.findall(r'\b\d[\d\.,]{6,}\b', text)
-    for num_str in numbers:
-        clean_num = re.sub(r'[^\d]', '', num_str)
-        if clean_num:
-            val = int(clean_num)
-            if 1_000_000 <= val <= 99_000_000:
-                return val
-
-    return 0
-
-def markdown_to_html(text: str) -> str:
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'^\*\s+', r'• ', text, flags=re.MULTILINE)
-    return text
-
-def fetch_url(url: str, timeout: int = 5):
+def fetch_url(url: str, timeout: int = 8):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     return requests.get(url, headers=headers, timeout=timeout)
+
+
+def extract_price_from_text(text: str) -> int:
+    # «9tr5» -> 9 500 000
+    m = re.search(r'(\d+)\s*tr\s*(\d+)', text, re.IGNORECASE)
+    if m:
+        try:
+            return int(float(f"{m.group(1)}.{m.group(2)}") * 1_000_000)
+        except ValueError:
+            pass
+
+    # «8tr», «8,5 triệu»; \b отсекает слова вроде «trên»
+    m = re.search(r'(\d+[\.,]?\d*)\s*(?:triệu|trieu|tr)\b', text, re.IGNORECASE)
+    if m:
+        try:
+            return int(float(m.group(1).replace(',', '.')) * 1_000_000)
+        except ValueError:
+            pass
+
+    for num_str in re.findall(r'(?<![\d.,])\d[\d\.,]{6,}(?![\d])', text):
+        clean = re.sub(r'[^\d]', '', num_str)
+        if clean:
+            val = int(clean)
+            if 1_000_000 <= val <= 99_000_000:
+                return val
+    return 0
+
+
+def _find_ad_dict(node, depth=0):
+    """Ищет в __NEXT_DATA__ словарь объявления (есть subject и body/price)."""
+    if depth > 8:
+        return None
+    if isinstance(node, dict):
+        if "subject" in node and ("body" in node or "price" in node):
+            return node
+        for v in node.values():
+            found = _find_ad_dict(v, depth + 1)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for v in node[:50]:
+            found = _find_ad_dict(v, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def parse_ad_page(html_text: str):
+    """Достаёт название, цену и описание ТОЛЬКО самого объявления.
+    Сначала пробует JSON из __NEXT_DATA__, потом h1 и блок описания."""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    title, desc, price = None, "", 0
+
+    nd = soup.find("script", id="__NEXT_DATA__")
+    if nd and nd.string:
+        try:
+            ad = _find_ad_dict(json.loads(nd.string))
+            if ad:
+                title = ad.get("subject")
+                desc = ad.get("body") or ""
+                p = ad.get("price")
+                if isinstance(p, (int, float)) and p > 0:
+                    price = int(p)
+        except Exception as e:
+            logging.warning(f"Не удалось разобрать __NEXT_DATA__: {e}")
+
+    if not title:
+        h1 = soup.find('h1')
+        title = h1.get_text().strip() if h1 else None
+
+    if not desc:
+        block = soup.find(
+            'div',
+            class_=lambda x: x and ('adBody' in x or 'description' in x.lower())
+        )
+        if block:
+            desc = block.get_text(separator="\n").strip()
+
+    if not title and not desc:
+        return None
+
+    title = (title or "Байк до 9 млн VND").strip()[:80]
+    desc = desc.strip()
+    if price == 0:
+        price = extract_price_from_text(f"{title}\n{desc}")
+
+    return {"title": title, "price": price, "description": desc[:3000]}
+
+
+def markdown_to_html(text: str) -> str:
+    text = html.escape(text, quote=False)  # сначала экранируем, потом размечаем
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
+    return text
+
+
+async def gemini_generate(contents: str) -> str:
+    response = await asyncio.wait_for(
+        asyncio.to_thread(
+            lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        ),
+        timeout=20.0,
+    )
+    return response.text
+
 
 async def analyze_ad_with_gemini(ad_text: str) -> str:
     prompt = (
@@ -328,143 +263,336 @@ async def analyze_ad_with_gemini(ad_text: str) -> str:
         "1. Точная модель, год и цена (в миллионах донг или VND).\n"
         "2. Состояние техники, мотора и документов.\n"
         "3. Вердикт: стоит ли ехать смотреть.\n\n"
-        f"Текст объявления:\n{ad_text}"
+        f"Текст объявления:\n{ad_text[:3000]}"
     )
     try:
-        loop = asyncio.get_event_loop()
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                None, 
-                lambda: client.models.generate_content(
-                    model='gemini-3.5-flash-lite',
-                    contents=prompt,
-                )
-            ),
-            timeout=15.0
-        )
-        return markdown_to_html(response.text)
+        text = await gemini_generate(prompt)
+        return markdown_to_html(text[:3000])
     except Exception as e:
         logging.error(f"Ошибка Gemini API: {e}")
         return "Не удалось проанализировать описание."
 
 
 # =====================================================================
-# 5. ПАРСИНГ И ФИЛЬТРАЦИЯ
+# 4. КНОПКИ И ОБРАБОТЧИКИ
 # =====================================================================
+async def set_main_menu(bot: Bot):
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🚀 Перезапустить бота"),
+        BotCommand(command="check", description="🔍 Проверить новые байки"),
+        BotCommand(command="favorites", description="⭐ Избранные байки"),
+        BotCommand(command="reset", description="🔄 Сбросить память"),
+    ])
+
+
+def get_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
+    is_active = user_notifications_active.get(chat_id, True)
+    toggle_text = "🔕 Выключить уведомления" if is_active else "🔔 Включить уведомления"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Проверить байки"), KeyboardButton(text="⭐ Избранное")],
+            [KeyboardButton(text=toggle_text)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+@dp.message(Command("start"))
+async def start_handler(message: types.Message):
+    global MY_CHAT_ID
+    MY_CHAT_ID = message.chat.id
+    save_json(CHAT_FILE, {"chat_id": MY_CHAT_ID})
+    user_notifications_active[message.chat.id] = True
+
+    await message.answer(
+        "Привет! 🛵 Бот готов к работе.\n\n"
+        "🎯 <b>Особенности:</b>\n"
+        "• Быстрое сканирование без задержек\n"
+        "• ИИ-анализ по клику на кнопку «🤖 Подробнее»\n"
+        "• Удобное избранное",
+        parse_mode="HTML",
+        reply_markup=get_keyboard(message.chat.id),
+    )
+
+
+@dp.message(F.text == "🔍 Проверить байки")
+@dp.message(Command("check"))
+async def manual_check_handler(message: types.Message):
+    await message.answer("🔍 Быстро сканирую байки до 9 млн VND...")
+    await check_chotot_and_notify(message.chat.id)
+
+
+@dp.message(F.text == "⭐ Избранное")
+@dp.message(Command("favorites"))
+async def show_favorites_handler(message: types.Message):
+    if not favorite_ads:
+        await message.answer(
+            "⭐ У тебя пока нет сохраненных байков в избранном.",
+            reply_markup=get_keyboard(message.chat.id),
+        )
+        return
+
+    await message.answer(
+        "⭐ <b>Твои сохраненные байки:</b>",
+        parse_mode="HTML",
+        reply_markup=get_keyboard(message.chat.id),
+    )
+
+    for url in list(favorite_ads):
+        info = sent_details.get(url, {})
+        title = info.get("title", "Байк из избранного")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{uid(url)}")],
+            [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{uid(url)}")],
+        ])
+        await message.answer(
+            f"🛵 <b>{esc(title)}</b>\n💰 {fmt_price(info.get('price', 0))}\n🔗 {url}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        await asyncio.sleep(0.2)
+
+
+@dp.message(Command("reset"))
+async def reset_history_handler(message: types.Message):
+    sent_ads.clear()
+    # Детали избранного оставляем, иначе у него пропадут названия и кнопка «Подробнее».
+    for url in list(sent_details):
+        if url not in favorite_ads:
+            del sent_details[url]
+    save_sent()
+    save_details()
+    await message.answer(
+        "🔄 Память сброшена! Избранное сохранено.",
+        reply_markup=get_keyboard(message.chat.id),
+    )
+
+
+@dp.message(F.text.in_(["🔕 Выключить уведомления", "🔔 Включить уведомления"]))
+async def toggle_notifications_handler(message: types.Message):
+    chat_id = message.chat.id
+    new_state = not user_notifications_active.get(chat_id, True)
+    user_notifications_active[chat_id] = new_state
+    text = "🔔 Уведомления включены!" if new_state else "🔕 Уведомления выключены."
+    await message.answer(text, reply_markup=get_keyboard(chat_id))
+
+
+@dp.callback_query(F.data.startswith("show_"))
+async def callback_show_details_handler(callback: types.CallbackQuery):
+    h = callback.data.replace("show_", "", 1)
+    target_url = find_url(h, sent_details)
+    if not target_url:
+        await callback.answer("⚠️ Информация не найдена (возможно, сброшена память).", show_alert=True)
+        return
+
+    await callback.answer("🤖 Генерирую анализ Gemini...")
+    info = sent_details[target_url]
+
+    ai_summary = info.get("summary")
+    if not ai_summary:
+        desc = info.get("description", "")
+        if not desc:
+            try:
+                resp = await asyncio.to_thread(fetch_url, target_url, 8)
+                if resp.status_code == 200:
+                    parsed = await asyncio.to_thread(parse_ad_page, resp.text)
+                    if parsed:
+                        desc = parsed["description"]
+                        info["description"] = desc
+            except Exception as e:
+                logging.error(f"Не удалось догрузить описание {target_url}: {e}")
+
+        ai_summary = await analyze_ad_with_gemini(desc or "Описание отсутствует")
+        if "Не удалось проанализировать" not in ai_summary:
+            info["summary"] = ai_summary  # неудачный результат не кэшируем
+            save_details()
+
+    text = (
+        f"🔥 <b>Детали байка:</b>\n"
+        f"🛵 {esc(info.get('title', ''))}\n\n"
+        f"💰 <b>Цена:</b> {fmt_price(info.get('price', 0))}\n"
+        f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}\n\n"
+        f"🔗 {target_url}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{uid(target_url)}")]
+    ])
+    await callback.message.answer(text[:4000], parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("fav_"))
+async def callback_favorite_handler(callback: types.CallbackQuery):
+    h = callback.data.replace("fav_", "", 1)
+    target_url = find_url(h, sent_details, favorite_ads)
+    if not target_url:
+        await callback.answer("⚠️ Ссылка не найдена.", show_alert=True)
+        return
+
+    if target_url in favorite_ads:
+        await callback.answer("⭐ Уже в избранном.", show_alert=True)
+    else:
+        favorite_ads[target_url] = True
+        save_favs()
+        await callback.answer("⭐ Добавлено в избранное!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("unfav_"))
+async def callback_unfavorite_handler(callback: types.CallbackQuery):
+    h = callback.data.replace("unfav_", "", 1)
+    target_url = find_url(h, favorite_ads)
+    if not target_url:
+        await callback.answer("⚠️ Уже удалено.", show_alert=True)
+        return
+
+    del favorite_ads[target_url]
+    save_favs()
+    await callback.answer("🗑 Удалено из избранного.", show_alert=True)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# Обычный чат с Gemini. Регистрируется ПОСЛЕ всех обработчиков кнопок,
+# поэтому служебные тексты сюда не доходят; команды отсекает фильтр.
+@dp.message(F.text & ~F.text.startswith("/"))
+async def chat_handler(message: types.Message):
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    try:
+        answer = await gemini_generate(message.text)
+        await message.answer(answer[:4000])
+    except Exception as e:
+        logging.error(f"Ошибка Gemini в чате: {e}")
+        await message.answer("⚠️ Не удалось получить ответ от Gemini. Попробуй еще раз через пару секунд.")
+
+
+# =====================================================================
+# 5. СКАНИРОВАНИЕ И ФИЛЬТРАЦИЯ
+# =====================================================================
+def extract_ad_links(listing_html: str):
+    soup = BeautifulSoup(listing_html, 'html.parser')
+    urls = []
+    for a in soup.find_all('a', href=True):
+        href = a['href'].split('?')[0]
+        if "-li" in href and re.search(r'\d+\.htm$', href):
+            url = "https://www.chotot.com" + href if href.startswith("/") else href
+            if url not in urls and url != CHOTOT_URL:
+                urls.append(url)
+    return urls
+
+
+async def fetch_ad(url: str, sem: asyncio.Semaphore):
+    async with sem:
+        try:
+            resp = await asyncio.to_thread(fetch_url, url, 8)
+            if resp.status_code != 200:
+                return url, None
+            return url, await asyncio.to_thread(parse_ad_page, resp.text)
+        except Exception as e:
+            logging.error(f"Ошибка при загрузке {url}: {e}")
+            return url, None
+
+
+def is_suitable(ad: dict) -> bool:
+    # Стоп-слова ищем только в названии и описании объявления, не по всей странице.
+    haystack = f"{ad['title']}\n{ad['description']}".lower()
+    if any(sw in haystack for sw in STOP_WORDS):
+        return False
+    if ad["price"] > MAX_PRICE_VND:
+        return False
+    return True
+
+
 async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
     if is_auto and not user_notifications_active.get(chat_id, True):
         return
 
-    try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: fetch_url(CHOTOT_URL, 10))
-        
-        if response.status_code != 200:
-            if not is_auto:
-                await bot.send_message(chat_id, f"⚠️ Сайт ответил с ошибкой: {response.status_code}")
-            return
+    if scan_lock.locked():
+        if not is_auto:
+            await bot.send_message(chat_id, "⏳ Сканирование уже идёт, подожди минуту.")
+        return
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        ads = soup.find_all('a', href=True)
-        
-        found_ad_urls = []
-        for ad in ads:
-            href = ad['href']
-            if "-li" in href and re.search(r'\d+\.htm$', href):
-                ad_url = "https://www.chotot.com" + href if href.startswith("/") else href
-                if ad_url not in found_ad_urls and ad_url != CHOTOT_URL:
-                    found_ad_urls.append(ad_url)
-        
-        total_found_on_page = len(found_ad_urls)
-        new_ads_count = 0
-        current_batch_scanned = []
+    async with scan_lock:
+        try:
+            response = await asyncio.to_thread(fetch_url, CHOTOT_URL, 10)
+            if response.status_code != 200:
+                if not is_auto:
+                    await bot.send_message(chat_id, f"⚠️ Сайт ответил с ошибкой: {response.status_code}")
+                return
 
-        for ad_url in found_ad_urls[:10]:
-            try:
-                sub_resp = await loop.run_in_executor(None, lambda: fetch_url(ad_url, 5))
-                if sub_resp.status_code != 200:
-                    continue
-                
-                sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
-                full_page_text = sub_soup.get_text()
-                full_page_text_lower = full_page_text.lower()
-                
-                if "mua ban xe" in full_page_text_lower and len(full_page_text) < 500:
+            found_urls = await asyncio.to_thread(extract_ad_links, response.text)
+            total_found = len(found_urls)
+
+            sem = asyncio.Semaphore(3)
+            results = await asyncio.gather(
+                *(fetch_ad(u, sem) for u in found_urls[:MAX_ADS_PER_SCAN])
+            )
+
+            new_count = 0
+            scanned = []
+
+            for url, ad in results:
+                if not ad or not is_suitable(ad):
                     continue
 
-                if any(stop_word in full_page_text_lower for stop_word in STOP_WORDS):
-                    continue
-
-                desc_block = sub_soup.find('div', class_=lambda x: x and ('adBody' in x or 'description' in x.lower()))
-                ad_description = desc_block.get_text(separator="\n") if desc_block else full_page_text[:2000]
-                
-                detected_price = extract_price_from_text(full_page_text)
-
-                if detected_price > 0 and detected_price > MAX_PRICE_VND:
-                    continue
-
-                title_tag = sub_soup.find('h1')
-                clean_title = title_tag.get_text().strip() if title_tag else "Байк до 9 млн VND"
-                clean_title = clean_title[:60]
-                
-                current_batch_scanned.append((ad_url, clean_title, detected_price))
-
-                sent_details[ad_url] = {
-                    "title": clean_title,
-                    "price": detected_price,
-                    "description": ad_description,
-                    "summary": None
+                scanned.append((url, ad["title"], ad["price"]))
+                old = sent_details.get(url, {})
+                sent_details[url] = {
+                    "title": ad["title"],
+                    "price": ad["price"],
+                    "description": ad["description"],
+                    "summary": old.get("summary"),
                 }
 
-                if ad_url not in sent_ads:
-                    sent_ads.add(ad_url)
-                    new_ads_count += 1
-                    
-                    price_str = f"{detected_price:,} VND" if detected_price > 0 else "Цена в описании"
-                    text = f"🔥 <b>Новый байк до 9 млн!</b>\n🛵 {clean_title}\n💰 {price_str}\n🔗 {ad_url}"
-                    
-                    inline_kb = InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{hash(ad_url)}")],
-                            [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{hash(ad_url)}")]
-                        ]
+                if url not in sent_ads:
+                    sent_ads[url] = True
+                    new_count += 1
+
+                    text = (
+                        f"🔥 <b>Новый байк до 9 млн!</b>\n"
+                        f"🛵 {esc(ad['title'])}\n"
+                        f"💰 {fmt_price(ad['price'])}\n"
+                        f"🔗 {url}"
                     )
-                    
-                    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=inline_kb)
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{uid(url)}")],
+                        [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{uid(url)}")],
+                    ])
+                    try:
+                        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+                    except Exception as e:
+                        logging.error(f"Не удалось отправить карточку {url}: {e}")
                     await asyncio.sleep(0.5)
 
-                save_json_data(SENT_TITLES_FILE, sent_details)
-                save_json_data(SENT_ADS_FILE, sent_ads)
+            trim_state()
+            save_details()
+            save_sent()
 
-            except Exception as sub_e:
-                logging.error(f"Ошибка при обработке {ad_url}: {sub_e}")
-                continue
-                
-        if len(sent_ads) > 500:
-            sent_ads.pop()
+            if not is_auto:
+                await bot.send_message(
+                    chat_id,
+                    f"📊 <b>Результат проверки:</b>\n"
+                    f"• Найдено ссылок на странице: <b>{total_found}</b>\n"
+                    f"• Прошло фильтр: <b>{len(scanned)}</b>\n"
+                    f"• Новых отправлено: <b>{new_count}</b>\n\n"
+                    f"📜 <b>Все подходящие варианты сейчас:</b>",
+                    parse_mode="HTML",
+                    reply_markup=get_keyboard(chat_id),
+                )
+                for url, title, price in scanned:
+                    await bot.send_message(
+                        chat_id,
+                        f"🛵 <b>{esc(title)}</b>\n💰 {fmt_price(price)}\n🔗 {url}",
+                        parse_mode="HTML",
+                    )
+                    await asyncio.sleep(0.2)
 
-        if not is_auto:
-            report_text = (
-                f"📊 <b>Результат проверки:</b>\n"
-                f"• Просканировано объявлений по фильтру: <b>{total_found_on_page}</b>\n"
-                f"• Новых подходящих отправлено: <b>{new_ads_count}</b>\n\n"
-                f"📜 <b>Все текущие варианты на странице:</b>"
-            )
-            
-            await bot.send_message(chat_id, report_text, parse_mode="HTML", reply_markup=get_keyboard(chat_id))
-
-            # В сводном списке убрали кнопки «Подробнее», теперь выводим просто чистый список с ценами
-            for url, title, price in current_batch_scanned:
-                price_str = f"{price:,} VND" if price > 0 else "Цена в описании"
-                await bot.send_message(chat_id, f"🛵 <b>{title}</b>\n💰 {price_str}\n🔗 {url}", parse_mode="HTML")
-                await asyncio.sleep(0.2)
-            
-    except Exception as e:
-        logging.error(f"Ошибка при парсинг-цикле: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка при парсинг-цикле: {e}")
 
 
 # =====================================================================
-# 6. ФОНОВЫЕ ЗАДАЧИ И ГЛАВНЫЙ ЗАПУСК
+# 6. ФОНОВЫЕ ЗАДАЧИ И ЗАПУСК
 # =====================================================================
 async def auto_check_loop():
     while True:
@@ -475,17 +603,23 @@ async def auto_check_loop():
             except Exception as e:
                 logging.error(f"Ошибка в автопроверке: {e}")
 
+
 async def main():
-    print("Запуск веб-сервера для Render...")
-    asyncio.create_task(start_web_server())
-    
-    print("Инициализация бота...")
+    logging.info("Запуск веб-сервера для Render...")
+    await start_web_server()
+
+    logging.info("Инициализация бота...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await set_main_menu(bot)
-    
-    asyncio.create_task(auto_check_loop())
-    
-    print("Бот запущен и слушает Telegram...")
-    await dp.start_polling(bot)
+
+    auto_task = asyncio.create_task(auto_check_loop())
+
+    logging.info("Бот запущен и слушает Telegram...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        auto_task.cancel()
+
 
 if __name__ == "__main__":
     try:
