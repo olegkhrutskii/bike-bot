@@ -6,6 +6,7 @@ import re
 import html
 import hashlib
 import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
@@ -290,6 +291,75 @@ def parse_ad_page(html_text: str):
     return {"title": title, "price": price, "description": desc[:3000]}
 
 
+# ---------- Диагностика: что за поля у объявления (команда /raw) ----------
+SELLER_HINT = re.compile(
+    r"company|seller|shop|store|business|agency|account_type|user_type|profile|verified"
+    r"|(^|\.)type$|(^|\.)pro$|(^|\.)f$|is_pro|private",
+    re.IGNORECASE,
+)
+NOISE_HINT = re.compile(r"image|thumb|avatar|video|banner|logo|html|description|body", re.IGNORECASE)
+
+
+def flatten_scalars(node, path="", depth=0, out=None):
+    """Разворачивает вложенный JSON в плоский список (путь, значение)."""
+    if out is None:
+        out = []
+    if depth > 7 or len(out) > 4000:
+        return out
+    if isinstance(node, dict):
+        for k, v in node.items():
+            flatten_scalars(v, f"{path}.{k}" if path else str(k), depth + 1, out)
+    elif isinstance(node, list):
+        for i, v in enumerate(node[:30]):
+            flatten_scalars(v, f"{path}[{i}]", depth + 1, out)
+    else:
+        out.append((path, node))
+    return out
+
+
+def is_safe_value(path: str, value) -> bool:
+    """Не показываем телефоны, почты и длинные тексты."""
+    low = path.lower()
+    if any(w in low for w in ("phone", "email", "tel", "mobile", "name", "address")):
+        return False
+    text = str(value)
+    if len(text) > 60:
+        return False
+    if re.fullmatch(r"\+?\d[\d\s.\-]{8,}", text):
+        return False
+    return True
+
+
+def build_raw_report(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    nd = soup.find("script", id="__NEXT_DATA__")
+    if not nd or not nd.string:
+        return "На странице нет блока __NEXT_DATA__ (данные подгружаются иначе). Напиши об этом Claude."
+    try:
+        data = json.loads(nd.string)
+    except Exception as e:
+        return f"Не удалось разобрать __NEXT_DATA__: {e}"
+
+    ad = _find_ad_dict(data)
+    lines = [f"Блок объявления найден: {'да' if ad else 'нет'}", ""]
+
+    lines.append("=== Поля про продавца и тип ===")
+    seller_lines = []
+    for path, value in flatten_scalars(data):
+        if SELLER_HINT.search(path) and is_safe_value(path, value) and not NOISE_HINT.search(path):
+            seller_lines.append(f"{path} = {value}")
+    lines += seller_lines[:45] or ["(ничего похожего не найдено)"]
+
+    lines += ["", "=== Основные поля объявления ==="]
+    ad_lines = []
+    if ad:
+        for path, value in flatten_scalars(ad):
+            if is_safe_value(path, value) and not NOISE_HINT.search(path):
+                ad_lines.append(f"{path} = {value}")
+    lines += ad_lines[:80] or ["(пусто)"]
+    return "\n".join(lines)
+
+
 def markdown_to_html(text: str) -> str:
     text = html.escape(text, quote=False)  # сначала экранируем, потом размечаем
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
@@ -404,6 +474,44 @@ async def status_handler(message: types.Message):
     )
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_keyboard(chat_id))
+
+
+@dp.message(Command("raw"))
+async def raw_handler(message: types.Message):
+    """Служебная команда: показывает, какие поля есть у объявления."""
+    if MY_CHAT_ID and message.chat.id != MY_CHAT_ID:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1:
+        url = parts[1].strip()
+    else:
+        url = list(sent_details)[-1] if sent_details else None
+
+    if not url:
+        await message.answer("Пришли команду со ссылкой: /raw https://www.chotot.com/...")
+        return
+
+    host = urlparse(url).hostname or ""
+    if not (host == "chotot.com" or host.endswith(".chotot.com")):
+        await message.answer("Нужна ссылка на объявление с chotot.com")
+        return
+
+    await message.answer(f"🔎 Загружаю объявление:\n{url}")
+    try:
+        resp = await asyncio.to_thread(fetch_url, url, 10)
+        if resp.status_code != 200:
+            await message.answer(f"Сайт ответил ошибкой {resp.status_code}")
+            return
+        report = await asyncio.to_thread(build_raw_report, resp.text)
+    except Exception as e:
+        logging.error(f"Ошибка /raw: {e}")
+        await message.answer("Не удалось загрузить объявление, попробуй ещё раз.")
+        return
+
+    # Без parse_mode, чтобы символы < > & не ломали отправку. Режем на части.
+    for i in range(0, min(len(report), 10500), 3500):
+        await message.answer(report[i:i + 3500])
 
 
 @dp.message(Command("id"))
