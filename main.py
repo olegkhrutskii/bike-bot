@@ -5,6 +5,8 @@ import json
 import re
 import html
 import hashlib
+import time
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 from google import genai
@@ -84,6 +86,9 @@ AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "600"))
 user_notifications_active = {}
 scan_lock = asyncio.Lock()
 rejected_ads: dict = {}  # объявления, не прошедшие фильтр (хранятся только в памяти)
+BOT_STARTED = time.time()
+VN_TZ = timezone(timedelta(hours=7))  # время Дананга
+last_check = {"time": None, "auto": False, "found": 0, "new": 0, "error": None}
 
 
 class RememberChatMiddleware(BaseMiddleware):
@@ -152,6 +157,24 @@ def fmt_price(price) -> str:
 
 def esc(text) -> str:
     return html.escape(str(text), quote=False)
+
+
+def open_button(url: str) -> list:
+    """Ссылка на объявление лежит в кнопке, а не в тексте, поэтому большого превью нет."""
+    return [InlineKeyboardButton(text="🔗 Открыть объявление", url=url)]
+
+
+def fmt_duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours:
+        parts.append(f"{hours} ч")
+    parts.append(f"{minutes} мин")
+    return " ".join(parts)
 
 
 # =====================================================================
@@ -310,6 +333,7 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="check", description="🔍 Проверить новые байки"),
         BotCommand(command="favorites", description="⭐ Избранные байки"),
         BotCommand(command="reset", description="🔄 Сбросить память"),
+        BotCommand(command="status", description="ℹ️ Статус бота"),
         BotCommand(command="id", description="🆔 Мой chat id"),
     ])
 
@@ -320,7 +344,7 @@ def get_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Проверить байки"), KeyboardButton(text="⭐ Избранное")],
-            [KeyboardButton(text=toggle_text)],
+            [KeyboardButton(text=toggle_text), KeyboardButton(text="ℹ️ Статус")],
         ],
         resize_keyboard=True,
     )
@@ -339,6 +363,47 @@ async def start_handler(message: types.Message):
         parse_mode="HTML",
         reply_markup=get_keyboard(message.chat.id),
     )
+
+
+@dp.message(F.text == "ℹ️ Статус")
+@dp.message(Command("status"))
+async def status_handler(message: types.Message):
+    chat_id = message.chat.id
+    lines = [
+        "ℹ️ <b>Статус бота</b>",
+        f"🟢 Работает без перезапуска: {fmt_duration(time.time() - BOT_STARTED)}",
+    ]
+
+    if last_check["time"]:
+        when = datetime.fromtimestamp(last_check["time"], VN_TZ).strftime("%d.%m %H:%M")
+        kind = "авто" if last_check["auto"] else "вручную"
+        if last_check["error"]:
+            lines.append(f"⚠️ Последняя проверка ({when}, {kind}) закончилась ошибкой: {esc(last_check['error'])}")
+        else:
+            lines.append(
+                f"🔄 Последняя проверка: {when} ({kind}), ссылок на странице "
+                f"{last_check['found']}, новых {last_check['new']}"
+            )
+    else:
+        lines.append("🔄 Проверок с момента запуска ещё не было")
+
+    lines.append(f"⏱ Автопроверка каждые {AUTO_CHECK_SECONDS // 60} мин")
+
+    if OWNER_FROM_ENV:
+        lines.append("📬 Чат для уведомлений: закреплён (OWNER_CHAT_ID)")
+    elif MY_CHAT_ID:
+        lines.append("📬 Чат для уведомлений: запомнен, но может сброситься при перезапуске (лучше задать OWNER_CHAT_ID)")
+    else:
+        lines.append("📬 Чат для уведомлений: не задан, нажми /start")
+
+    notif = "включены" if user_notifications_active.get(chat_id, True) else "выключены"
+    lines.append(f"🔔 Уведомления: {notif}")
+    lines.append(
+        f"🧠 В памяти: отправлено {len(sent_ads)}, отклонено фильтром {len(rejected_ads)}, "
+        f"в избранном {len(favorite_ads)}"
+    )
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_keyboard(chat_id))
 
 
 @dp.message(Command("id"))
@@ -376,11 +441,12 @@ async def show_favorites_handler(message: types.Message):
         info = sent_details.get(url, {})
         title = info.get("title", "Байк из избранного")
         kb = InlineKeyboardMarkup(inline_keyboard=[
+            open_button(url),
             [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{uid(url)}")],
             [InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav_{uid(url)}")],
         ])
         await message.answer(
-            f"🛵 <b>{esc(title)}</b>\n💰 {fmt_price(info.get('price', 0))}\n🔗 {url}",
+            f"🛵 <b>{esc(title)}</b>\n💰 {fmt_price(info.get('price', 0))}",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -445,11 +511,11 @@ async def callback_show_details_handler(callback: types.CallbackQuery):
         f"🔥 <b>Детали байка:</b>\n"
         f"🛵 {esc(info.get('title', ''))}\n\n"
         f"💰 <b>Цена:</b> {fmt_price(info.get('price', 0))}\n"
-        f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}\n\n"
-        f"🔗 {target_url}"
+        f"🤖 <b>Анализ Gemini:</b>\n{ai_summary}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{uid(target_url)}")]
+        open_button(target_url),
+        [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{uid(target_url)}")],
     ])
     await callback.message.answer(text[:4000], parse_mode="HTML", reply_markup=kb)
 
@@ -631,10 +697,10 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
                     f"{header}\n"
                     f"{tag_line}"
                     f"🛵 {esc(ad['title'])}\n"
-                    f"💰 {fmt_price(ad['price'])}\n"
-                    f"🔗 {url}"
+                    f"💰 {fmt_price(ad['price'])}"
                 )
                 kb = InlineKeyboardMarkup(inline_keyboard=[
+                    open_button(url),
                     [InlineKeyboardButton(text="🤖 Подробнее (ИИ-анализ)", callback_data=f"show_{uid(url)}")],
                     [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{uid(url)}")],
                 ])
@@ -650,6 +716,10 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
             trim_state()
             save_details()
             save_sent()
+
+            last_check.update(
+                time=time.time(), auto=is_auto, found=total_found, new=new_count, error=None
+            )
 
             if not is_auto:
                 if new_count > 0:
@@ -676,6 +746,7 @@ async def check_chotot_and_notify(chat_id: int, is_auto: bool = False):
 
         except Exception as e:
             logging.error(f"Ошибка при парсинг-цикле: {e}")
+            last_check.update(time=time.time(), auto=is_auto, error=str(e)[:100])
 
 
 # =====================================================================
